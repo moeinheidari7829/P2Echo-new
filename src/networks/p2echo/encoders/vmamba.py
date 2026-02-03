@@ -29,7 +29,7 @@ except:
 
 # cross selective scan ===============================
 if True:
-    from .selective_scan import selective_scan_cuda_core as selective_scan_cuda
+    import selective_scan_cuda_core as selective_scan_cuda
     
     class SelectiveScan(torch.autograd.Function):
         @staticmethod

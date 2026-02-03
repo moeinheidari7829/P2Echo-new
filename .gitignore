@@ -30,10 +30,13 @@ pretrained_pth/
 *.pth
 *.pt
 *.ckpt
-
+*.out
 # IDEs
 .vscode/
 .idea/
 
 # OS
 .DS_Store
+.triton_cache/
+.config/
+.cache/

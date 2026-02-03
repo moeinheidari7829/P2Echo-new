@@ -1,6 +1,5 @@
 import torch
 from .pvtv2 import pvt_v2_b0, pvt_v2_b1, pvt_v2_b2, pvt_v2_b3, pvt_v2_b4, pvt_v2_b5
-from .resnet import resnet18, resnet34, resnet50, resnet101, resnet152
 
 
 def get_encoder2d(input_channels=1, encoder='pvt_v2_b2', pretrain=False, freeze_bb=False, base_ptdir='.'):

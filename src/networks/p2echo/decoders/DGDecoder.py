@@ -508,6 +508,21 @@ class DGDecoder(nn.Module):
         self.patch_size = patch_size
         self.patches_resolution = [img_size[0] // patch_size, img_size[1] // patch_size]
         self.deep_supervision = deep_supervision
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+
+        # Build input projection layers for encoder->decoder channel mismatches
+        # Decoder expects channels: [embed_dim, embed_dim*2, embed_dim*4, embed_dim*8]
+        # e.g., with embed_dim=64: [64, 128, 256, 512]
+        # PVT-v2-B2 outputs: [64, 128, 320, 512] -> only stage 2 (320 vs 256) needs projection
+        self.input_projs = nn.ModuleList()
+        for i in range(self.num_layers):
+            encoder_ch = in_channels[i]  # encoder output channel for this stage
+            decoder_ch = int(embed_dim * (2 ** i))  # decoder expected channel
+            if encoder_ch != decoder_ch:
+                self.input_projs.append(nn.Conv2d(encoder_ch, decoder_ch, kernel_size=1, bias=False))
+            else:
+                self.input_projs.append(nn.Identity())
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
@@ -592,12 +607,15 @@ class DGDecoder(nn.Module):
         if not self.deep_supervision:
             for inx, layer_up in enumerate(self.layers_up):
                 if inx == 0:
-                    x = inputs[3 - inx]  # B, 768, 15, 20
-                    x = x.permute(0, 2, 3, 1).contiguous()  # B, 15, 20, 768
-                    y = layer_up(x)  # B, 30, 40, 384
+                    # Apply input projection if needed (handles encoder->decoder channel mismatch)
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
+                    x = skip_feat.permute(0, 2, 3, 1).contiguous()  # B, H, W, C'
+                    y = layer_up(x)
                 else:
+                    # Apply input projection if needed
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
                     # interpolate y to input size (only pst900 dataset needs)
-                    B, C, H, W = inputs[3 - inx].shape
+                    B, C, H, W = skip_feat.shape
                     y = (
                         F.interpolate(
                             y.permute(0, 3, 1, 2).contiguous(),
@@ -609,7 +627,7 @@ class DGDecoder(nn.Module):
                         .contiguous()
                     )
 
-                    x = y + inputs[3 - inx].permute(0, 2, 3, 1).contiguous()
+                    x = y + skip_feat.permute(0, 2, 3, 1).contiguous()
                     y = layer_up(x)
 
             x = self.norm_up(y)
@@ -620,12 +638,15 @@ class DGDecoder(nn.Module):
             x_upsample = []
             for inx, layer_up in enumerate(self.layers_up):
                 if inx == 0:
-                    x = inputs[3 - inx]  # B, 768, 15, 20
-                    x = x.permute(0, 2, 3, 1).contiguous()  # B, 15, 20, 768
-                    y = layer_up(x)  # B, 30, 40, 384
+                    # Apply input projection if needed (handles encoder->decoder channel mismatch)
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
+                    x = skip_feat.permute(0, 2, 3, 1).contiguous()  # B, H, W, C'
+                    y = layer_up(x)
                     x_upsample.append(self.norm_ds[inx](y))
                 else:
-                    x = y + inputs[3 - inx].permute(0, 2, 3, 1).contiguous()
+                    # Apply input projection if needed
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
+                    x = y + skip_feat.permute(0, 2, 3, 1).contiguous()
                     y = layer_up(x)
                     if inx != self.num_layers - 1:
                         x_upsample.append((self.norm_ds[inx](y)))
