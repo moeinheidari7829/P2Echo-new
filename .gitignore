@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# CUDA/Build
+selective_scan/csrc/build/
+selective_scan/build/
+
+# Pretrained weights
+pretrained_pth/
+*.pth
+*.pt
+*.ckpt
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
