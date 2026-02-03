@@ -73,14 +73,14 @@ python src/train.py \
     --output_dir "./outputs" \
     --run_name "${RUN_NAME}" \
     --image_size 256 \
-    --batch_size 8 \
+    --batch_size 32 \
     --num_workers 4 \
     --pretrained_encoder \
     --pretrained_dir "./pretrained_pth" \
     --text_model "${TEXT_MODEL}" \
     --text_cache_dir "${HF_HOME}/hub" \
     --epochs 200 \
-    --lr 1e-4 \
+    --lr 4e-4 \
     --weight_decay 1e-4 \
     --grad_clip 1.0 \
     --aug_clip 3.0 \

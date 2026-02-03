@@ -40,3 +40,4 @@ pretrained_pth/
 .triton_cache/
 .config/
 .cache/
+/outputs/

@@ -16,6 +16,8 @@ import numpy as np
 import torch
 
 # medpy for CENet-style metrics
+if not hasattr(np, "bool"):
+    np.bool = np.bool_  # type: ignore[attr-defined]
 try:
     from medpy.metric.binary import dc, jc, hd95, assd
     MEDPY_AVAILABLE = True

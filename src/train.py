@@ -8,11 +8,9 @@ Binary per-prompt paradigm matching original VoxTell.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import time
 from collections import defaultdict
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -31,14 +29,13 @@ from matplotlib.patches import Patch
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
-from data import MultiTaskEchoDataset, load_splits_json, make_loaders
+from data import load_splits_json, make_loaders
 from data.augment import build_nnunet_2d_train_transforms, apply_batchgenerators_transforms
 from losses import DeepSupervisionDiceBCELoss
+from metrics import MEDPY_AVAILABLE, MetricAggregator
 from prompts import (
-    ID_TO_LONG,
     LABEL_TO_ID,
     PromptSpec,
-    build_batch_prompt_texts,
     build_background_prompt_text,
     build_prompt_text_from_view,
     default_prompt_specs,
@@ -110,95 +107,59 @@ def set_seed(seed: int) -> None:
 # Metrics
 # =============================================================================
 
-def hd95_binary(gt: np.ndarray, pred: np.ndarray) -> float:
-    """
-    95th percentile Hausdorff distance for 2D binary masks.
-    Uses scipy if available; otherwise returns NaN.
-    """
-    try:
-        from scipy.ndimage import distance_transform_edt
-    except Exception:
-        return float("nan")
-
-    gt = gt.astype(bool)
-    pred = pred.astype(bool)
-
-    if gt.sum() == 0 and pred.sum() == 0:
-        return 0.0
-    if gt.sum() == 0 or pred.sum() == 0:
-        h, w = gt.shape
-        return float(np.sqrt(h * h + w * w))
-
-    dt_gt = distance_transform_edt(~gt)
-    dt_pred = distance_transform_edt(~pred)
-    dist_gt_to_pred = dt_pred[gt]
-    dist_pred_to_gt = dt_gt[pred]
-    all_dists = np.concatenate([dist_gt_to_pred, dist_pred_to_gt])
-    return float(np.percentile(all_dists, 95))
-
-
-def compute_prompt_metrics(
+def _format_summary_table(
     *,
-    pred: np.ndarray,  # [B,N,H,W] bool
-    gt: np.ndarray,  # [B,N,H,W] bool
-) -> Dict[str, Any]:
-    """
-    Compute Dice/IoU/HD95 per prompt and macro-averages.
+    summary: Dict[str, Dict[str, float]],
+    title: str,
+) -> str:
+    class_order = ["LV", "MYO", "LA", "RV", "RA"]
+    header = f"{'Class':>8} | {'Dice':>10} | {'IoU':>10} | {'HD95':>10} | {'ASSD':>10}"
+    lines = [title, header, "-" * len(header)]
 
-    Aggregation:
-      - Dice/IoU: computed from global TP/FP/FN per prompt.
-      - HD95: mean over images where gt or pred is non-empty.
-    """
-    if pred.shape != gt.shape:
-        raise ValueError(f"pred/gt shape mismatch: {pred.shape} vs {gt.shape}")
+    mean_acc = {"dice": [], "iou": [], "hd95": [], "assd": []}
+    for cls in class_order:
+        m = summary.get(cls)
+        if not m:
+            continue
+        dice = m.get("dice_mean", float("nan"))
+        iou = m.get("iou_mean", float("nan"))
+        hd95 = m.get("hd95_mean", float("nan"))
+        assd = m.get("assd_mean", float("nan"))
+        lines.append(f"{cls:>8} | {dice:>10.4f} | {iou:>10.4f} | {hd95:>10.2f} | {assd:>10.2f}")
+        if np.isfinite(dice):
+            mean_acc["dice"].append(dice)
+        if np.isfinite(iou):
+            mean_acc["iou"].append(iou)
+        if np.isfinite(hd95):
+            mean_acc["hd95"].append(hd95)
+        if np.isfinite(assd):
+            mean_acc["assd"].append(assd)
 
-    b, n, _, _ = gt.shape
-    tp = np.zeros((n,), dtype=np.float64)
-    fp = np.zeros((n,), dtype=np.float64)
-    fn = np.zeros((n,), dtype=np.float64)
-    gt_pos = np.zeros((n,), dtype=np.float64)
-    hd_lists: List[List[float]] = [[] for _ in range(n)]
+    if any(mean_acc.values()):
+        mean_dice = float(np.mean(mean_acc["dice"])) if mean_acc["dice"] else float("nan")
+        mean_iou = float(np.mean(mean_acc["iou"])) if mean_acc["iou"] else float("nan")
+        mean_hd95 = float(np.mean(mean_acc["hd95"])) if mean_acc["hd95"] else float("nan")
+        mean_assd = float(np.mean(mean_acc["assd"])) if mean_acc["assd"] else float("nan")
+        lines.append("-" * len(header))
+        lines.append(
+            f"{'Mean':>8} | {mean_dice:>10.4f} | {mean_iou:>10.4f} | {mean_hd95:>10.2f} | {mean_assd:>10.2f}"
+        )
 
-    for i in range(b):
-        for p in range(n):
-            g = gt[i, p]
-            pr = pred[i, p]
-            tp[p] += np.logical_and(pr, g).sum()
-            fp[p] += np.logical_and(pr, ~g).sum()
-            fn[p] += np.logical_and(~pr, g).sum()
-            gt_pos[p] += g.sum()
-            if g.any() or pr.any():
-                hd_lists[p].append(hd95_binary(g, pr))
+    return "\n".join(lines)
 
-    eps = 1e-6
-    dice = (2.0 * tp) / (2.0 * tp + fp + fn + eps)
-    iou = tp / (tp + fp + fn + eps)
-    hd95 = np.array([float(np.mean(v)) if len(v) else float("nan") for v in hd_lists], dtype=np.float64)
 
-    # Macro-averages (ignore prompts with no GT positives and exclude BG for mean_dice_fg)
-    mask_fg = gt_pos > 0
-    if n > 0:
-        mask_fg[0] = False  # drop BG from "fg" means
-    mean_dice_fg = float(np.nanmean(dice[mask_fg])) if mask_fg.any() else float("nan")
-    mean_iou_fg = float(np.nanmean(iou[mask_fg])) if mask_fg.any() else float("nan")
-    mean_hd95_fg = float(np.nanmean(hd95[mask_fg])) if mask_fg.any() else float("nan")
-
-    mean_dice_all = float(np.nanmean(dice))
-    mean_iou_all = float(np.nanmean(iou))
-    mean_hd95_all = float(np.nanmean(hd95))
-
-    return {
-        "dice_per_prompt": dice,
-        "iou_per_prompt": iou,
-        "hd95_per_prompt": hd95,
-        "mean_dice_fg": mean_dice_fg,
-        "mean_iou_fg": mean_iou_fg,
-        "mean_hd95_fg": mean_hd95_fg,
-        "mean_dice_all": mean_dice_all,
-        "mean_iou_all": mean_iou_all,
-        "mean_hd95_all": mean_hd95_all,
-        "gt_pos_per_prompt": gt_pos,
-    }
+def _format_grouped_tables(
+    *,
+    grouped: Dict[str, Dict[str, Dict[str, float]]],
+    title: str,
+) -> str:
+    if not grouped:
+        return f"{title}\n(no data)"
+    lines = ["=" * 80, title, "=" * 80]
+    for key in sorted(grouped.keys()):
+        lines.append("")
+        lines.append(_format_summary_table(summary=grouped[key], title=f"{key}:"))
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -564,10 +525,12 @@ def validate(
     threshold: float = 0.5,
     max_qual_per_dataset: int = 3,
 ) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+    if not MEDPY_AVAILABLE:
+        raise RuntimeError("medpy is required for validation metrics. Install medpy or disable medpy-style metrics.")
+
     model.eval()
 
-    all_preds: List[np.ndarray] = []
-    all_gts: List[np.ndarray] = []
+    agg = MetricAggregator()
     qual_examples: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     for batch in loader:
@@ -603,14 +566,22 @@ def validate(
             logits = outputs
 
         probs = torch.sigmoid(logits)  # [B,N,H,W]
-        preds = (probs > threshold).cpu().numpy().astype(bool)  # [B,N,H,W]
+        probs_np = probs.detach().float().cpu().numpy()
+        gt_np = gt.detach().cpu().numpy().astype(np.uint8)
 
-        # Build binary GT
-        binary_targets = make_binary_targets(gt_mask=gt, prompt_specs=prompt_specs)  # [B,N,H,W]
-        gts = binary_targets.cpu().numpy().astype(bool)
-
-        all_preds.append(preds)
-        all_gts.append(gts)
+        # Per-case medpy metrics (multiclass)
+        for i in range(b):
+            pred_mc = preds_to_multiclass_mask(
+                probs=probs_np[i],
+                prompt_specs=prompt_specs,
+                threshold=threshold,
+            )
+            agg.update(
+                pred_mc,
+                gt_np[i],
+                view=str(planes[i]),
+                dataset=str(datasets[i]),
+            )
 
         # Collect qualitative examples
         for i in range(b):
@@ -624,11 +595,7 @@ def validate(
                     "stem": str(stems[i]) if stems else "",
                 })
 
-    # Concatenate and compute metrics
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_gts = np.concatenate(all_gts, axis=0)
-
-    metrics = compute_prompt_metrics(pred=all_preds, gt=all_gts)
+    metrics = agg.to_dict()
     return metrics, qual_examples
 
 
@@ -799,14 +766,26 @@ def main():
                 use_amp=args.use_amp,
                 amp_dtype=amp_dtype,
             )
-            
-            mean_dice = metrics["mean_dice_fg"]
-            _log(f"[{_now()}] Val Dice FG: {mean_dice:.4f}, IoU FG: {metrics['mean_iou_fg']:.4f}", log_path)
-            
-            # Per-prompt dice
-            prompt_names = ["BG", "LV", "MYO", "LA", "RV", "RA"]
-            dice_str = " | ".join(f"{n}:{d:.3f}" for n, d in zip(prompt_names, metrics["dice_per_prompt"]))
-            _log(f"[{_now()}] Per-prompt Dice: {dice_str}", log_path)
+
+            mean_metrics = metrics.get("mean_metrics", {})
+            mean_dice = mean_metrics.get("mean_dice", float("nan"))
+            mean_iou = mean_metrics.get("mean_iou", float("nan"))
+            mean_hd95 = mean_metrics.get("mean_hd95", float("nan"))
+            mean_assd = mean_metrics.get("mean_assd", float("nan"))
+            _log(
+                f"[{_now()}] Val Mean Dice: {mean_dice:.4f}, IoU: {mean_iou:.4f}, "
+                f"HD95: {mean_hd95:.2f}, ASSD: {mean_assd:.2f}",
+                log_path,
+            )
+
+            overall_summary = metrics.get("overall", {})
+            _log(_format_summary_table(summary=overall_summary, title="OVERALL METRICS"), log_path)
+
+            per_view = metrics.get("per_view", {})
+            _log(_format_grouped_tables(grouped=per_view, title="PER-VIEW BREAKDOWN"), log_path)
+
+            per_dataset = metrics.get("per_dataset", {})
+            _log(_format_grouped_tables(grouped=per_dataset, title="PER-DATASET BREAKDOWN"), log_path)
             
             # Save qualitative
             save_qualitative_per_dataset(
@@ -816,7 +795,7 @@ def main():
             )
             
             # Check best
-            is_best = mean_dice > best_dice
+            is_best = np.isfinite(mean_dice) and mean_dice > best_dice
             if is_best:
                 best_dice = mean_dice
                 _log(f"[{_now()}] New best dice: {best_dice:.4f}", log_path)
