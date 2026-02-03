@@ -41,6 +41,7 @@ from prompts import (
     default_prompt_specs,
     make_binary_targets,
     present_label_set,
+    view_label_set,
 )
 from networks.p2echo.net import P2Echo
 from networks.p2echo.text_encoder import FrozenTextBackbone
@@ -205,6 +206,27 @@ def preds_to_multiclass_mask(
     out = np.zeros((h, w), dtype=np.uint8)
     out[max_prob >= float(threshold)] = np.array(class_ids, dtype=np.uint8)[arg[max_prob >= float(threshold)]]
     return out
+
+
+def mask_probs_for_labels(
+    *,
+    probs: np.ndarray,  # [N,H,W] in [0,1]
+    prompt_specs: Sequence[PromptSpec],
+    valid_label_ids: Sequence[int],
+) -> np.ndarray:
+    """
+    Zero out probabilities for labels not present/visible for a given sample.
+    This prevents absent classes from winning the argmax in visualization.
+    """
+    keep = set(int(x) for x in valid_label_ids)
+    masked = probs.copy()
+    for pi, spec in enumerate(prompt_specs):
+        lids = [int(x) for x in spec.label_ids if int(x) != 0]
+        if len(lids) != 1:
+            continue
+        if lids[0] not in keep:
+            masked[pi] = 0.0
+    return masked
 
 
 def save_qualitative_grid(
@@ -569,19 +591,40 @@ def validate(
         probs_np = probs.detach().float().cpu().numpy()
         gt_np = gt.detach().cpu().numpy().astype(np.uint8)
 
+        masked_probs_list: List[np.ndarray] = []
+
         # Per-case medpy metrics (multiclass)
         for i in range(b):
-            pred_mc = preds_to_multiclass_mask(
+            ds = str(datasets[i])
+            view = str(planes[i])
+            present = set(present_label_set(ds))
+            visible = set(view_label_set(view))
+            valid_labels = sorted(
+                LABEL_TO_ID[l] for l in (present & visible)
+                if l in LABEL_TO_ID and l != "BG"
+            )
+
+            masked_probs = mask_probs_for_labels(
                 probs=probs_np[i],
+                prompt_specs=prompt_specs,
+                valid_label_ids=valid_labels,
+            )
+            masked_probs_list.append(masked_probs)
+
+            pred_mc = preds_to_multiclass_mask(
+                probs=masked_probs,
                 prompt_specs=prompt_specs,
                 threshold=threshold,
             )
-            agg.update(
-                pred_mc,
-                gt_np[i],
-                view=str(planes[i]),
-                dataset=str(datasets[i]),
-            )
+
+            if valid_labels:
+                agg.update(
+                    pred_mc,
+                    gt_np[i],
+                    view=view,
+                    dataset=ds,
+                    class_ids=valid_labels,
+                )
 
         # Collect qualitative examples
         for i in range(b):
@@ -590,7 +633,7 @@ def validate(
                 qual_examples[ds].append({
                     "image": img[i].cpu(),
                     "gt": gt[i].cpu(),
-                    "probs": probs[i].cpu(),
+                    "probs": torch.from_numpy(masked_probs_list[i]),
                     "plane": str(planes[i]),
                     "stem": str(stems[i]) if stems else "",
                 })
