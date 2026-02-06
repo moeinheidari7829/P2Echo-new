@@ -16,6 +16,7 @@ from timm.layers import DropPath
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 
 from .MambaDecoder import PatchExpand, UpsampleExpand, FinalUpsample_X4
+from ..modules.dseb import DSEBlock
 
 
 class LocalBranch(nn.Module):
@@ -524,6 +525,24 @@ class DGDecoder(nn.Module):
             else:
                 self.input_projs.append(nn.Identity())
 
+        # DSEB blocks for skip connections (replaces additive skip)
+        self.dseb_blocks = nn.ModuleList()
+        for i_layer in range(1, self.num_layers):  # Skip first layer (no skip connection)
+            dim = int(embed_dim * 2 ** (self.num_layers - 1 - i_layer))
+            resolution = self.patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer))
+            num_heads = max(2, dim // 32)  # Adaptive heads based on dim
+            self.dseb_blocks.append(
+                DSEBlock(
+                    dim=dim,
+                    scale_factors=[0.8, 0.4],
+                    num_heads=num_heads,
+                    input_size=resolution,
+                    mode='add',
+                    use_command='dat-fea',
+                    depth=i_layer,
+                )
+            )
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
         self.layers_up = nn.ModuleList()
@@ -627,7 +646,10 @@ class DGDecoder(nn.Module):
                         .contiguous()
                     )
 
-                    x = y + skip_feat.permute(0, 2, 3, 1).contiguous()
+                    # DSEB skip connection (replaces additive skip)
+                    y_chw = y.permute(0, 3, 1, 2).contiguous()  # B, C, H, W
+                    x_chw = self.dseb_blocks[inx - 1](skip=skip_feat, dec=y_chw)  # DSEB
+                    x = x_chw.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
                     y = layer_up(x)
 
             x = self.norm_up(y)
@@ -646,7 +668,17 @@ class DGDecoder(nn.Module):
                 else:
                     # Apply input projection if needed
                     skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
-                    x = y + skip_feat.permute(0, 2, 3, 1).contiguous()
+                    # Interpolate y to match skip_feat size if needed
+                    B, C, H, W = skip_feat.shape
+                    y_interp = F.interpolate(
+                        y.permute(0, 3, 1, 2).contiguous(),
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    # DSEB skip connection (replaces additive skip)
+                    x_chw = self.dseb_blocks[inx - 1](skip=skip_feat, dec=y_interp)  # DSEB
+                    x = x_chw.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
                     y = layer_up(x)
                     if inx != self.num_layers - 1:
                         x_upsample.append((self.norm_ds[inx](y)))

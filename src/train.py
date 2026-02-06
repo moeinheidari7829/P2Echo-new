@@ -424,8 +424,9 @@ def train_one_epoch(
     text_backbone: FrozenTextBackbone,
     loader,
     prompt_specs: Sequence[PromptSpec],
-    loss_fn: DeepSupervisionDiceBCELoss,
+    loss_fn,
     optim: torch.optim.Optimizer,
+    scheduler,  # Added: per-iteration scheduler
     device: torch.device,
     train_aug,
     use_amp: bool,
@@ -519,6 +520,10 @@ def train_one_epoch(
 
         loss_sum += loss.item()
         n_batches += 1
+        
+        # Step scheduler per-iteration (CENet style poly decay)
+        if scheduler is not None:
+            scheduler.step()
 
         if batch_idx % 50 == 0:
             msg = f"[{_now()}] Epoch {epoch} | Batch {batch_idx} | Loss {loss.item():.4f}"
@@ -664,14 +669,17 @@ def main():
     
     # Training
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--optimizer", type=str, default="sgd", choices=["adamw", "sgd"])
+    parser.add_argument("--lr", type=float, default=0.05)  # CENet default for SGD
+    parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--aug_clip", type=float, default=3.0)
+    parser.add_argument("--aug_clip", type=float, default=1.5)  # Reduced from 3.0
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--permute_prompts", action="store_true")
     parser.add_argument("--disable_aug", action="store_true")
+    parser.add_argument("--loss_type", type=str, default="boundary", choices=["dice_bce", "boundary"])
     
     # Output
     parser.add_argument("--output_dir", type=str, default="./outputs")
@@ -746,16 +754,38 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     _log(f"[{_now()}] Total params: {total_params:,}, Trainable: {trainable_params:,}", log_path)
     
-    # Optimizer
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Optimizer (SGD with momentum like CENet, or AdamW)
+    if args.optimizer.lower() == "sgd":
+        _log(f"[{_now()}] Using SGD optimizer with lr={args.lr}, momentum={args.momentum}", log_path)
+        optim = torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        _log(f"[{_now()}] Using AdamW optimizer with lr={args.lr}", log_path)
+        optim = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
     
-    # Scheduler (poly)
-    def poly_lr(epoch: int) -> float:
-        return (1 - epoch / args.epochs) ** 0.9
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, poly_lr)
+    # Scheduler (poly decay per iteration, like CENet)
+    max_iterations = args.epochs * len(train_loader)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optim,
+        lr_lambda=lambda step: (1 - step / max_iterations) ** 0.9
+    )
     
-    # Loss
-    loss_fn = DeepSupervisionDiceBCELoss()
+    # Loss (BoundaryDoU or DiceBCE)
+    if args.loss_type == "boundary":
+        from losses import DeepSupervisionBoundaryDoULoss
+        _log(f"[{_now()}] Using BoundaryDoU loss", log_path)
+        loss_fn = DeepSupervisionBoundaryDoULoss()
+    else:
+        _log(f"[{_now()}] Using DiceBCE loss", log_path)
+        loss_fn = DeepSupervisionDiceBCELoss()
     
     # AMP
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -784,6 +814,7 @@ def main():
             prompt_specs=prompt_specs,
             loss_fn=loss_fn,
             optim=optim,
+            scheduler=scheduler,  # Per-iteration scheduler
             device=device,
             train_aug=train_aug,
             use_amp=args.use_amp,
@@ -795,8 +826,7 @@ def main():
             epoch=epoch,
         )
         _log(f"[{_now()}] Train loss: {train_loss:.4f}", log_path)
-        
-        scheduler.step()
+        # Note: scheduler.step() is now called per-iteration inside train_one_epoch
         
         # Validation
         if (epoch + 1) % args.val_interval == 0:

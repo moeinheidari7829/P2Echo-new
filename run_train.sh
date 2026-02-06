@@ -80,10 +80,13 @@ python src/train.py \
     --text_model "${TEXT_MODEL}" \
     --text_cache_dir "${HF_HOME}/hub" \
     --epochs 200 \
-    --lr 4e-4 \
+    --optimizer sgd \
+    --lr 0.05 \
+    --momentum 0.9 \
     --weight_decay 1e-4 \
     --grad_clip 1.0 \
-    --aug_clip 3.0 \
+    --aug_clip 1.5 \
+    --loss_type boundary \
     --permute_prompts \
     --use_amp \
     --bf16 \
@@ -91,3 +94,4 @@ python src/train.py \
     --val_interval 1 \
     --seed 42 \
     "$@"
+

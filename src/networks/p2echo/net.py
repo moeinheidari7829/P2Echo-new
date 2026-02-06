@@ -82,12 +82,12 @@ class P2Echo(nn.Module):
         pretrained_encoder: bool = True,
         freeze_encoder: bool = False,
         pretrained_dir: str = ".",
-        # Text conditioning config
+        # Text conditioning config (original P2Echo settings)
         text_embedding_dim: int = 1024,  # Qwen3-Embedding-0.6B
-        query_dim: int = 384,
-        transformer_layers: int = 3,
-        transformer_heads: int = 6,
-        transformer_ffn_dim: int = 1024,
+        query_dim: int = 864,  # Original P2Echo (was 384)
+        transformer_layers: int = 6,  # Original P2Echo (was 3)
+        transformer_heads: int = 8,  # Original P2Echo (was 6)
+        transformer_ffn_dim: int = 2048,  # Original P2Echo (was 1024)
         # Decoder config
         decoder_depths: Tuple[int, ...] = (4, 2, 1, 1),
         decoder_embed_dim: int = 64,
