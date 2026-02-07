@@ -41,3 +41,4 @@ pretrained_pth/
 .config/
 .cache/
 /outputs/
+logs/

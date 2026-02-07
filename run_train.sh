@@ -57,7 +57,7 @@ export TOKENIZERS_PARALLELISM=false
 # Training Configuration
 # ============================================================================
 
-RUN_NAME=${RUN_NAME:-"p2echo_pvt_dgdecoder"}
+RUN_NAME=${RUN_NAME:-"p2echo_v2_small_transformer"}
 TEXT_MODEL=${TEXT_MODEL:-"Qwen/Qwen3-Embedding-0.6B"}
 
 echo "=============================================="
@@ -86,8 +86,7 @@ python src/train.py \
     --weight_decay 1e-4 \
     --grad_clip 1.0 \
     --aug_clip 1.5 \
-    --loss_type boundary \
-    --permute_prompts \
+    --loss_type dice_ce \
     --use_amp \
     --bf16 \
     --save_interval 10 \

@@ -40,17 +40,57 @@ class EchoSample:
     mask_path: str
 
 
-def normalize_image(img: torch.Tensor) -> torch.Tensor:
+def normalize_image(img: torch.Tensor, eps: float = 1e-8, use_foreground_only: bool = True) -> torch.Tensor:
     """
-    Normalize image tensor from [0,1] to [-1,1].
-    
+    Z-score normalize an image tensor.
+
+    If ``use_foreground_only`` is True, statistics are computed only on foreground pixels
+    (assumed to be non-zero), and background pixels are kept at 0. This matches the common
+    nnU-Net setting where normalization is computed inside the valid (non-zero) region.
+
     Args:
-        img: [C, H, W] tensor in [0, 1]
-    
+        img: Image tensor, typically ``[C, H, W]`` in ``[0, 1]`` (or ``[H, W]``).
+        eps: Minimum std for numerical stability.
+        use_foreground_only: If True, compute mean/std only on non-zero pixels.
+
     Returns:
-        Normalized tensor in [-1, 1]
+        Normalized image tensor (float32).
     """
-    return (img - 0.5) / 0.5
+    img = img.to(torch.float32)
+
+    if img.ndim == 2:
+        if use_foreground_only:
+            mask = img.ne(0)
+            if mask.any():
+                mean = img[mask].mean()
+                std = img[mask].std(unbiased=False).clamp_min(eps)
+                out = img.clone()
+                out[mask] = (out[mask] - mean) / std
+                out[~mask] = 0
+                return out
+
+        mean = img.mean()
+        std = img.std(unbiased=False).clamp_min(eps)
+        return (img - mean) / std
+
+    if img.ndim != 3:
+        raise ValueError(f"Expected img with shape [C,H,W] or [H,W], got {tuple(img.shape)}")
+
+    if use_foreground_only:
+        mask2d = img.ne(0).any(dim=0)  # foreground where any channel is non-zero
+        if mask2d.any():
+            mask = mask2d.unsqueeze(0).expand_as(img)
+            mean = img[mask].mean()
+            std = img[mask].std(unbiased=False).clamp_min(eps)
+            out = img.clone()
+            out[mask] = (out[mask] - mean) / std
+            out[~mask] = 0
+            return out
+
+    mean = img.mean()
+    std = img.std(unbiased=False).clamp_min(eps)
+    return (img - mean) / std
+
 
 
 class MultiTaskEchoDataset(Dataset):

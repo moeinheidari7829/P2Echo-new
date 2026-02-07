@@ -120,89 +120,62 @@ class DeepSupervisionDiceBCELoss(nn.Module):
 
 
 # =============================================================================
-# Multi-class variants (for reference, not used in binary per-prompt paradigm)
+# Multi-class Dice + CE
 # =============================================================================
 
 class DiceCELoss(nn.Module):
     """
-    Dice + CE for logits.
+    Multi-class Dice + Cross-Entropy loss for categorical segmentation.
 
     Expects:
-      logits:  [B, N, H, W] (or [B, N, ...])
-      targets: same shape, categorical
+      logits:  [B, C, H, W] raw logits (C = num_classes)
+      targets: [B, H, W] categorical labels in {0, ..., C-1}
+
+    All classes are always supervised. If a class is absent in the image,
+    the model is penalized for predicting it (false positives). The text
+    prompts tell the model which classes to segment and which not to.
     """
 
-    def __init__(self, smooth: float = 1e-5) -> None:
+    def __init__(self, smooth: float = 1e-5, ce_weight: float = 1.0, dice_weight: float = 1.0) -> None:
         super().__init__()
         self.smooth = float(smooth)
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
 
     def forward(
-        self, 
-        logits: torch.Tensor, 
-        targets: torch.Tensor, 
-        valid_mask: torch.Tensor | None = None
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        **kwargs,  # Accept and ignore extra args (e.g. valid_mask) for API compat
     ) -> torch.Tensor:
-        # Important for mixed precision stability: compute loss in fp32.
         logits = logits.float()
-        if targets.ndim == logits.ndim and targets.shape[1] == logits.shape[1]:
-            targets = targets.argmax(dim=1)
         targets = targets.long()
-        
-        if targets.numel() > 0:
-            max_t = int(targets.max().item())
-            if max_t >= logits.shape[1]:
-                if max_t == logits.shape[1]:
-                    zeros = torch.zeros(
-                        (logits.shape[0], 1, *logits.shape[2:]), device=logits.device, dtype=logits.dtype
-                    )
-                    logits = torch.cat([zeros, logits], dim=1)
-                    if valid_mask is not None:
-                        valid_mask = F.pad(valid_mask, (1, 0), value=0.0)
-                else:
-                    raise ValueError(
-                        f"targets has label id {max_t} but logits has only {logits.shape[1]} classes"
-                    )
-        
-        if valid_mask is not None:
-            if valid_mask.ndim != 2:
-                raise ValueError(f"valid_mask must be [B,N], got {tuple(valid_mask.shape)}")
-            if valid_mask.shape[0] != logits.shape[0] or valid_mask.shape[1] != logits.shape[1]:
-                raise ValueError(
-                    f"valid_mask shape mismatch: {tuple(valid_mask.shape)} vs logits {tuple(logits.shape)}"
-                )
-            valid_mask = valid_mask.float()
+        C = logits.shape[1]
 
-        dims = tuple(range(1, targets.ndim))
-        # CE (per-sample, per-prompt)
-        ce = F.cross_entropy(logits, targets, reduction="none").mean(dims)
+        # Cross-Entropy (per-sample)
+        ce = F.cross_entropy(logits, targets, reduction="none").mean(dim=(1, 2))  # [B]
 
-        targets_oh = F.one_hot(targets, num_classes=logits.shape[1]).float().permute(0, 3, 1, 2)
+        # Soft Dice (per-class, per-sample)
+        probs = F.softmax(logits, dim=1)  # [B, C, H, W]
+        targets_oh = F.one_hot(targets, num_classes=C).float().permute(0, 3, 1, 2)  # [B, C, H, W]
 
-        dims = tuple(range(2, targets_oh.ndim))
-        # Dice (soft) (per-sample, per-prompt)
-        probs = F.softmax(logits, dim=1)
-        tp = (probs * targets_oh).sum(dims)
-        fp = (probs * (1.0 - targets_oh)).sum(dims)
-        fn = ((1.0 - probs) * targets_oh).sum(dims)
+        tp = (probs * targets_oh).sum(dim=(2, 3))           # [B, C]
+        fp = (probs * (1.0 - targets_oh)).sum(dim=(2, 3))   # [B, C]
+        fn = ((1.0 - probs) * targets_oh).sum(dim=(2, 3))   # [B, C]
         dice = (2.0 * tp + self.smooth) / (2.0 * tp + fp + fn + self.smooth)
-        dice_loss = 1.0 - dice  # [B,N]
+        dice_loss = (1.0 - dice).mean(dim=1)  # [B], averaged over classes
 
-        loss_ce = dice_loss + ce.view(-1, 1)  # [B,N]
-
-        if valid_mask is None:
-            return loss_ce.mean()
-
-        loss_ce = loss_ce * valid_mask
-        denom = valid_mask.sum().clamp(min=1.0)
-        return loss_ce.sum() / denom
+        # Combine
+        loss = self.ce_weight * ce + self.dice_weight * dice_loss  # [B]
+        return loss.mean()
 
 
 class DeepSupervisionDiceCELoss(nn.Module):
     """
     Applies Dice+CE at all deep supervision outputs using nnU-Net-style weights.
 
-    outputs: list of logits tensors, highest resolution first, each [B,N,H_i,W_i]
-    targets: categorical targets [B,H,W] at full resolution
+    outputs: list of logits tensors, highest resolution first, each [B, C, H_i, W_i]
+    targets: categorical targets [B, H, W] at full resolution (values 0..C-1)
     """
 
     def __init__(self, smooth: float = 1e-5) -> None:
@@ -210,10 +183,10 @@ class DeepSupervisionDiceCELoss(nn.Module):
         self.base = DiceCELoss(smooth=smooth)
 
     def forward(
-        self, 
-        outputs: Sequence[torch.Tensor], 
-        targets: torch.Tensor, 
-        valid_mask: torch.Tensor | None = None
+        self,
+        outputs: Sequence[torch.Tensor],
+        targets: torch.Tensor,
+        **kwargs,  # Accept and ignore extra args for API compat
     ) -> torch.Tensor:
         if not isinstance(outputs, (list, tuple)) or len(outputs) == 0:
             raise ValueError("outputs must be a non-empty list/tuple of tensors")
@@ -222,13 +195,10 @@ class DeepSupervisionDiceCELoss(nn.Module):
 
         loss = 0.0
         for w, out in zip(weights, outputs):
-            # Handle both [B,H,W] and [B,C,H,W] style targets.
-            if targets.ndim == 3:
-                tgt = F.interpolate(targets.unsqueeze(1).float(), size=out.shape[-2:], mode="nearest").squeeze(1)
-            else:
-                tgt = F.interpolate(targets.float(), size=out.shape[-2:], mode="nearest")
-            tgt = tgt.long()
-            loss = loss + (float(w) * self.base(out, tgt, valid_mask=valid_mask))
+            tgt = F.interpolate(
+                targets.unsqueeze(1).float(), size=out.shape[-2:], mode="nearest"
+            ).squeeze(1).long()
+            loss = loss + (float(w) * self.base(out, tgt))
         return loss
 
 

@@ -167,16 +167,45 @@ def _format_grouped_tables(
 # Qualitative Visualization
 # =============================================================================
 
-def denorm_img(img: torch.Tensor) -> np.ndarray:
+def denorm_img(img: torch.Tensor, p_low: float = 1.0, p_high: float = 99.0) -> np.ndarray:
     """
-    img: [3,H,W] normalized by (x-0.5)/0.5 -> roughly [-1,1]
-    returns grayscale [H,W] in [0,1]
+    Convert a normalized tensor into a displayable grayscale image in [0, 1].
+
+    Handles common cases:
+      - already in [0, 1] (no-op)
+      - [-1, 1] style normalization (maps via x*0.5+0.5)
+      - z-score style normalization (robust percentile rescale)
+
+    Args:
+        img: Tensor [C,H,W] or [H,W]
+        p_low/p_high: Percentiles used for robust rescaling (z-score case)
+
+    Returns:
+        Grayscale image [H,W] float32 in [0, 1]
     """
     x = img.detach().cpu().float()
-    x = x * 0.5 + 0.5
-    x = torch.clamp(x, 0.0, 1.0)
-    x = x.mean(dim=0)  # grayscale
-    return x.numpy()
+    if x.ndim == 3:
+        x = x.mean(dim=0)  # grayscale
+    x_np = x.numpy()
+    if not np.isfinite(x_np).all():
+        x_np = np.nan_to_num(x_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+    vmin = float(np.min(x_np))
+    vmax = float(np.max(x_np))
+
+    if vmin >= 0.0 and vmax <= 1.0:
+        out = x_np
+    elif vmin >= -1.5 and vmax <= 1.5:
+        out = x_np * 0.5 + 0.5
+    else:
+        lo = float(np.percentile(x_np, float(p_low)))
+        hi = float(np.percentile(x_np, float(p_high)))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-8:
+            out = np.zeros_like(x_np, dtype=np.float32)
+        else:
+            out = (x_np - lo) / (hi - lo)
+
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 def preds_to_multiclass_mask(
@@ -384,6 +413,99 @@ def build_valid_prompt_mask(
 
 
 # =============================================================================
+# Random Prompt Sampling (training diversity)
+# =============================================================================
+
+def build_random_prompt_mask(
+    *,
+    datasets: Sequence[str],
+    prompt_specs: Sequence[PromptSpec],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Randomly sample which non-BG prompts are active for each sample.
+
+    For each sample:
+      1. Determine which non-BG classes are available (present in the dataset)
+      2. Sample k ~ Uniform(1, num_available) classes to activate
+      3. BG prompt (index 0) is always active
+
+    Active prompts → "segment X" text; inactive → "don't segment / background" text.
+    The GT should be adjusted accordingly (inactive class pixels → BG).
+
+    Returns:
+        [B, N] float tensor: 1.0 for active prompts, 0.0 for inactive
+    """
+    import random
+
+    b = len(datasets)
+    n = len(prompt_specs)
+    mask = torch.zeros((b, n), device=device, dtype=torch.float32)
+
+    for bi, ds in enumerate(datasets):
+        # BG always active
+        mask[bi, 0] = 1.0
+
+        # Find which non-BG prompts are available for this dataset
+        present = set(present_label_set(str(ds)))
+        present_ids = {int(LABEL_TO_ID[p]) for p in present if p in LABEL_TO_ID}
+
+        available_indices = []
+        for pi, spec in enumerate(prompt_specs):
+            if pi == 0:  # Skip BG
+                continue
+            ids = [int(x) for x in spec.label_ids if int(x) != 0]
+            if ids and all(lid in present_ids for lid in ids):
+                available_indices.append(pi)
+
+        if len(available_indices) > 0:
+            # Sample k from 1 to num_available (inclusive)
+            k = random.randint(1, len(available_indices))
+            chosen = random.sample(available_indices, k)
+            for pi in chosen:
+                mask[bi, pi] = 1.0
+
+    return mask
+
+
+def mask_categorical_targets(
+    gt: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    prompt_specs: Sequence[PromptSpec],
+) -> torch.Tensor:
+    """
+    Relabel pixels of inactive (unsampled) classes as background (0).
+
+    For each inactive non-BG prompt, all GT pixels matching that class become BG.
+    This ensures the loss penalizes the model for predicting classes it was told
+    not to segment.
+
+    Args:
+        gt: [B, H, W] categorical targets (0..C-1)
+        prompt_mask: [B, N] float — 1.0 active, 0.0 inactive
+        prompt_specs: list of PromptSpec
+
+    Returns:
+        [B, H, W] modified categorical targets
+    """
+    masked_gt = gt.clone()
+    for pi, spec in enumerate(prompt_specs):
+        if pi == 0:  # BG always active
+            continue
+        label_ids = [int(x) for x in spec.label_ids if int(x) != 0]
+        # Find samples where this prompt is inactive
+        inactive = (prompt_mask[:, pi] < 0.5)  # [B]
+        if not inactive.any():
+            continue
+        # Relabel this class's pixels as BG for inactive samples
+        for lid in label_ids:
+            label_pixels = (masked_gt == lid)  # [B, H, W]
+            inactive_mask = inactive[:, None, None].expand_as(label_pixels)
+            masked_gt[label_pixels & inactive_mask] = 0
+    return masked_gt
+
+
+# =============================================================================
 # Prompt Permutation
 # =============================================================================
 
@@ -436,6 +558,8 @@ def train_one_epoch(
     permute_prompts: bool = True,
     log_path: Path | None = None,
     epoch: int = 0,
+    use_categorical_targets: bool = False,
+    use_all_prompts: bool = False,
 ) -> float:
     model.train()
     loss_sum = 0.0
@@ -471,24 +595,41 @@ def train_one_epoch(
         # Build valid_mask for this batch
         valid_mask = build_valid_prompt_mask(datasets=datasets, prompt_specs=prompt_specs, device=device)
 
-        # Build binary targets from multi-class GT
-        binary_targets = make_binary_targets(gt_mask=gt, prompt_specs=prompt_specs)  # [B,N,H,W]
+        # Random prompt sampling: randomly select a subset of available classes
+        # Unselected classes get "don't segment" prompts and their GT pixels → BG
+        if not use_all_prompts:
+            prompt_mask = build_random_prompt_mask(
+                datasets=datasets, prompt_specs=prompt_specs, device=device,
+            )
+        else:
+            # All available prompts are active
+            prompt_mask = valid_mask.clone()
+            prompt_mask[:, 0] = 1.0  # BG always active
 
-        # Build text embeddings
+        # Build targets
+        if use_categorical_targets:
+            # Categorical GT [B, H, W] — relabel inactive classes as BG
+            targets = mask_categorical_targets(gt, prompt_mask, prompt_specs)
+        else:
+            # Binary per-prompt targets [B, N, H, W]
+            targets = make_binary_targets(gt_mask=gt, prompt_specs=prompt_specs)
+
+        # Build text embeddings (prompt_mask controls "segment X" vs "don't segment")
         text_emb = build_text_embeddings(
             text_backbone=text_backbone,
             planes=planes,
             gt_mask=gt,
             prompt_specs=prompt_specs,
             device=device,
+            prompt_mask=prompt_mask if use_categorical_targets else None,
         )
 
-        # Prompt permutation (if enabled)
-        if permute_prompts:
+        # Prompt permutation (if enabled) — only for binary targets
+        if permute_prompts and not use_categorical_targets:
             perm = build_random_prompt_permutation(batch_size=b, num_prompts=n, device=device)
             text_emb = apply_prompt_permutation(text_emb, perm)
             # Permute targets and valid_mask too
-            binary_targets = binary_targets.gather(1, perm[:, :, None, None].expand(-1, -1, binary_targets.shape[2], binary_targets.shape[3]))
+            targets = targets.gather(1, perm[:, :, None, None].expand(-1, -1, targets.shape[2], targets.shape[3]))
             valid_mask = valid_mask.gather(1, perm)
 
         optim.zero_grad()
@@ -499,7 +640,7 @@ def train_one_epoch(
                 outputs = model(img, text_emb)
                 if not isinstance(outputs, (list, tuple)):
                     outputs = [outputs]
-                loss = loss_fn(outputs, binary_targets, valid_mask=valid_mask)
+                loss = loss_fn(outputs, targets, valid_mask=valid_mask)
 
             scaler.scale(loss).backward()
             if grad_clip > 0:
@@ -511,7 +652,7 @@ def train_one_epoch(
             outputs = model(img, text_emb)
             if not isinstance(outputs, (list, tuple)):
                 outputs = [outputs]
-            loss = loss_fn(outputs, binary_targets, valid_mask=valid_mask)
+            loss = loss_fn(outputs, targets, valid_mask=valid_mask)
 
             loss.backward()
             if grad_clip > 0:
@@ -678,8 +819,10 @@ def main():
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--permute_prompts", action="store_true")
+    parser.add_argument("--use_all_prompts", action="store_true",
+                        help="Use all available prompts every iteration (default: randomly sample a subset)")
     parser.add_argument("--disable_aug", action="store_true")
-    parser.add_argument("--loss_type", type=str, default="boundary", choices=["dice_bce", "boundary"])
+    parser.add_argument("--loss_type", type=str, default="dice_ce", choices=["dice_bce", "boundary", "dice_ce"])
     
     # Output
     parser.add_argument("--output_dir", type=str, default="./outputs")
@@ -739,6 +882,7 @@ def main():
     
     # Model
     _log(f"[{_now()}] Building P2Echo model...", log_path)
+    num_classes = len(prompt_specs)
     model = P2Echo(
         input_channels=3,
         img_size=(args.image_size, args.image_size),
@@ -746,6 +890,7 @@ def main():
         pretrained_encoder=args.pretrained_encoder,
         pretrained_dir=args.pretrained_dir,
         text_embedding_dim=text_backbone.embedding_dim,
+        num_classes=num_classes,
         deep_supervision=True,
     )
     model = model.to(device)
@@ -783,9 +928,16 @@ def main():
         from losses import DeepSupervisionBoundaryDoULoss
         _log(f"[{_now()}] Using BoundaryDoU loss", log_path)
         loss_fn = DeepSupervisionBoundaryDoULoss()
-    else:
+    elif args.loss_type == "dice_bce":
+        from losses import DeepSupervisionDiceBCELoss
         _log(f"[{_now()}] Using DiceBCE loss", log_path)
         loss_fn = DeepSupervisionDiceBCELoss()
+    elif args.loss_type == "dice_ce":
+        from losses import DeepSupervisionDiceCELoss
+        _log(f"[{_now()}] Using DiceCE loss", log_path)
+        loss_fn = DeepSupervisionDiceCELoss()
+    else:
+        raise ValueError(f"Invalid loss type: {args.loss_type}. Choose from: boundary, dice_bce, dice_ce")
     
     # AMP
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -824,6 +976,8 @@ def main():
             permute_prompts=args.permute_prompts,
             log_path=log_path,
             epoch=epoch,
+            use_categorical_targets=(args.loss_type == "dice_ce"),
+            use_all_prompts=args.use_all_prompts,
         )
         _log(f"[{_now()}] Train loss: {train_loss:.4f}", log_path)
         # Note: scheduler.step() is now called per-iteration inside train_one_epoch

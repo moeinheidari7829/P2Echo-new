@@ -4,11 +4,10 @@ Text-conditioned cross-attention transformer for P2Echo.
 This module enables text-guided segmentation by letting text prompt embeddings
 attend to image features, producing mask embeddings that guide the decoder.
 
-Optimized architecture (vs original P2Echo):
-- Query dim: 384 (vs 864 original)
-- 3 layers (vs 6 original)  
-- 6 heads (vs 8 original)
-- No self-attention between prompts (only 6 prompts, minimal benefit)
+Architecture:
+- Self-attention among prompts (spatial competition / complementary patterns)
+- Cross-attention from prompts to image features
+- Post-norm residual connections
 
 Based on:
 - Original P2Echo (voxtell/model/transformer.py)
@@ -110,15 +109,15 @@ class TransformerDecoder(nn.Module):
 
 class TransformerDecoderLayer(nn.Module):
     """
-    Single transformer decoder layer with cross-attention and FFN.
+    Single transformer decoder layer with self-attention, cross-attention, and FFN.
     
-    Architecture (pre-norm style):
-        1. LayerNorm → Cross-Attention (text queries attend to image features)
-        2. LayerNorm → Feed-Forward Network
+    Architecture (post-norm style):
+        1. Self-Attention among prompts → residual → LayerNorm
+        2. Cross-Attention (prompts attend to image features) → residual → LayerNorm
+        3. Feed-Forward Network → residual → LayerNorm
     
-    Note: No self-attention between prompts. With only 6 prompts representing
-    distinct anatomical structures, self-attention adds parameters without
-    proportional benefit.
+    Self-attention enables prompts to coordinate spatially — e.g., if LV claims
+    a region, MYO can adjust its attention to the surrounding boundary.
     
     Args:
         d_model: Model dimension (default: 384)
@@ -138,6 +137,9 @@ class TransformerDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         
+        # Self-attention among prompts
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        
         # Cross-attention: text queries attend to image features
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         
@@ -146,11 +148,13 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
-        # Normalization layers (pre-norm style)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        # Post-norm layers (applied after residual connection)
+        self.norm1 = nn.LayerNorm(d_model)  # after self-attn
+        self.norm2 = nn.LayerNorm(d_model)  # after cross-attn
+        self.norm3 = nn.LayerNorm(d_model)  # after FFN
         
         # Dropout layers
+        self.dropout_sa = nn.Dropout(dropout)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -172,35 +176,45 @@ class TransformerDecoderLayer(nn.Module):
         query_pos: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
-        Pre-norm forward pass.
+        Post-norm forward pass: sublayer → residual → norm.
         
         Args:
             tgt: Target sequence (text queries) [N, B, C]
             memory: Memory (image features) [HW, B, C]
+            tgt_mask: Self-attention mask for target
+            memory_mask: Cross-attention mask
+            tgt_key_padding_mask: Padding mask for target keys
+            memory_key_padding_mask: Padding mask for memory keys
             pos: Positional embeddings for memory [HW, B, C]
             query_pos: Positional embeddings for queries (optional)
             
         Returns:
             Tuple of (output, attention_weights):
             - output: [N, B, C]
-            - attention_weights: [B, N, HW] attention map
+            - attention_weights: [B, N, HW] cross-attention map
         """
-        # Cross-attention with pre-norm
-        # Q = text queries, K/V = image features with position
-        tgt2 = self.norm1(tgt)
+        # 1. Self-attention among prompts (post-norm)
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt2, _ = self.self_attn(
+            q, k, value=tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+        )
+        tgt = self.norm1(tgt + self.dropout_sa(tgt2))
+        
+        # 2. Cross-attention: prompts attend to image features (post-norm)
         tgt2, attn_weights = self.cross_attn(
-            query=self.with_pos_embed(tgt2, query_pos),
+            query=self.with_pos_embed(tgt, query_pos),
             key=self.with_pos_embed(memory, pos),
             value=memory,
             attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask
+            key_padding_mask=memory_key_padding_mask,
         )
-        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm2(tgt + self.dropout1(tgt2))
         
-        # Feed-forward network with pre-norm
-        tgt2 = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout2(tgt2)
+        # 3. Feed-forward network (post-norm)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = self.norm3(tgt + self.dropout2(tgt2))
         
         return tgt, attn_weights
 

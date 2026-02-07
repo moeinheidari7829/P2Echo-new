@@ -589,23 +589,41 @@ class DGDecoder(nn.Module):
 
         self.norm_up = norm_layer(embed_dim)
         if self.deep_supervision:
+            # DS features are collected at injection point (BEFORE upsample)
+            # so channels are pre-upsample dims:
+            #   Stage 0: embed_dim * 2^(n-2)  = 256  (after PatchExpand from 512)
+            #   Stage 1: embed_dim * 2^(n-1-1) = 256  (Mamba_up dim, before PatchExpand)
+            #   Stage 2: embed_dim * 2^(n-1-2) = 128  (Mamba_up dim, before PatchExpand)
+            ds_channels = []
+            for i_layer in range(self.num_layers - 1):
+                if i_layer == 0:
+                    ch = int(embed_dim * 2 ** (self.num_layers - 2))
+                else:
+                    ch = int(embed_dim * 2 ** (self.num_layers - 1 - i_layer))
+                ds_channels.append(ch)
             self.norm_ds = nn.ModuleList(
-                [
-                    norm_layer(embed_dim * 2 ** (self.num_layers - 2 - i_layer))
-                    for i_layer in range(self.num_layers - 1)
-                ]
+                [norm_layer(ch) for ch in ds_channels]
             )
             self.output_ds = nn.ModuleList(
-                [
-                    nn.Conv2d(
-                        in_channels=embed_dim * 2 ** (self.num_layers - 2 - i_layer),
-                        out_channels=self.num_classes,
-                        kernel_size=1,
-                        bias=False,
-                    )
-                    for i_layer in range(self.num_layers - 1)
-                ]
+                [nn.Conv2d(ch, self.num_classes, kernel_size=1, bias=False) for ch in ds_channels]
             )
+
+        # Text injection: per-stage fusion layers (stages 1-3 only, not stage 0)
+        # Stage 0 is just PatchExpand with no Mamba blocks, so no injection there.
+        # Injection happens after the first Mamba block, before remaining blocks + upsample.
+        # Pre-upsample channel dims:
+        #   Stage 1: embed_dim * 2^(n-1-1)  = 256  (Mamba_up dim, before PatchExpand)
+        #   Stage 2: embed_dim * 2^(n-1-2)  = 128  (Mamba_up dim, before PatchExpand)
+        #   Stage 3: embed_dim              = 64   (Mamba_up dim, no upsample)
+        # inject_convs[0] -> stage 1, inject_convs[1] -> stage 2, etc.
+        self.inject_convs = nn.ModuleList()
+        for i_layer in range(1, self.num_layers):
+            ch = int(embed_dim * 2 ** (self.num_layers - 1 - i_layer))
+            self.inject_convs.append(nn.Sequential(
+                nn.Conv2d(2 * ch, ch, kernel_size=1, bias=False),
+                nn.GroupNorm(max(1, ch // 16), ch),
+                nn.GELU(),
+            ))
 
         # print("---final upsample expand_first---")
         # self.up = FinalPatchExpand_X4(input_resolution=(img_size[0] // patch_size, img_size[1] // patch_size),
@@ -622,53 +640,60 @@ class DGDecoder(nn.Module):
             bias=False,
         )
 
-    def forward_up_features(self, inputs):  # B, C, H, W
+    def _inject_text(self, y, mask_embed, stage_idx):
+        """
+        Inject text features into decoder features at a given stage.
+        
+        Computes attention maps via einsum, aggregates text embeddings weighted
+        by attention, concatenates with decoder features, and fuses via 1x1 conv.
+        
+        Args:
+            y: [B, H, W, C] decoder features (BHWC format)
+            mask_embed: [B, N, C] projected mask embedding for this stage
+            stage_idx: decoder stage index (1-based, stages 1-3 only)
+        
+        Returns:
+            [B, H, W, C] text-enriched decoder features
+        """
+        y_bchw = y.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+        
+        # Compute per-class attention maps
+        attn = torch.einsum("b c h w, b n c -> b n h w", y_bchw, mask_embed)  # [B, N, H, W]
+        
+        # Aggregate text embeddings weighted by attention at each spatial location
+        text_feat = torch.einsum(
+            "b n h w, b n c -> b c h w", attn.sigmoid(), mask_embed
+        )  # [B, C, H, W]
+        
+        # Concatenate decoder features with text features and fuse
+        # inject_convs is indexed 0-based for stages 1-3 (stage_idx - 1)
+        fused = self.inject_convs[stage_idx - 1](
+            torch.cat([y_bchw, text_feat], dim=1)
+        )  # [B, 2C, H, W] -> [B, C, H, W]
+        
+        return fused.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+
+    def forward_up_features(self, inputs, inject_mask_embeds):  # B, C, H, W
+        """
+        Args:
+            inputs: list of encoder features [shallowest to deepest]
+            inject_mask_embeds: list of 3 projected mask embeddings for stages 1-3
+                                inject_mask_embeds[0] -> stage 1, [1] -> stage 2, [2] -> stage 3
+
+        Text injection happens after the first Mamba block, before remaining blocks
+        and upsample, at the pre-upsample channel dimension.
+        DS features are collected after all blocks, before upsample.
+        """
         if not self.deep_supervision:
             for inx, layer_up in enumerate(self.layers_up):
                 if inx == 0:
-                    # Apply input projection if needed (handles encoder->decoder channel mismatch)
-                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
-                    x = skip_feat.permute(0, 2, 3, 1).contiguous()  # B, H, W, C'
-                    y = layer_up(x)
+                    # Stage 0: PatchExpand only (no Mamba blocks, no text injection)
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])
+                    x = skip_feat.permute(0, 2, 3, 1).contiguous()
+                    y = layer_up(x)  # PatchExpand: 512 -> 256ch
                 else:
-                    # Apply input projection if needed
-                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
-                    # interpolate y to input size (only pst900 dataset needs)
-                    B, C, H, W = skip_feat.shape
-                    y = (
-                        F.interpolate(
-                            y.permute(0, 3, 1, 2).contiguous(),
-                            size=(H, W),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        .permute(0, 2, 3, 1)
-                        .contiguous()
-                    )
-
-                    # DSEB skip connection (replaces additive skip)
-                    y_chw = y.permute(0, 3, 1, 2).contiguous()  # B, C, H, W
-                    x_chw = self.dseb_blocks[inx - 1](skip=skip_feat, dec=y_chw)  # DSEB
-                    x = x_chw.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
-                    y = layer_up(x)
-
-            x = self.norm_up(y)
-
-            return x
-        else:
-            # if deep supervision
-            x_upsample = []
-            for inx, layer_up in enumerate(self.layers_up):
-                if inx == 0:
-                    # Apply input projection if needed (handles encoder->decoder channel mismatch)
-                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
-                    x = skip_feat.permute(0, 2, 3, 1).contiguous()  # B, H, W, C'
-                    y = layer_up(x)
-                    x_upsample.append(self.norm_ds[inx](y))
-                else:
-                    # Apply input projection if needed
-                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])  # B, C', H, W
-                    # Interpolate y to match skip_feat size if needed
+                    # Stages 1-3: DSEB skip + block0 + inject + remaining blocks + upsample
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])
                     B, C, H, W = skip_feat.shape
                     y_interp = F.interpolate(
                         y.permute(0, 3, 1, 2).contiguous(),
@@ -676,50 +701,108 @@ class DGDecoder(nn.Module):
                         mode="bilinear",
                         align_corners=False,
                     )
-                    # DSEB skip connection (replaces additive skip)
-                    x_chw = self.dseb_blocks[inx - 1](skip=skip_feat, dec=y_interp)  # DSEB
-                    x = x_chw.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
-                    y = layer_up(x)
-                    if inx != self.num_layers - 1:
-                        x_upsample.append((self.norm_ds[inx](y)))
+                    # DSEB skip connection
+                    x_chw = self.dseb_blocks[inx - 1](skip=skip_feat, dec=y_interp)
+                    x = x_chw.permute(0, 2, 3, 1).contiguous()
+
+                    # Run Mamba blocks with text injection after the first block
+                    for i, blk in enumerate(layer_up.blocks):
+                        if layer_up.use_checkpoint:
+                            x = checkpoint.checkpoint(blk, x)
+                        else:
+                            x = blk(x)
+                        # Inject after first block so remaining blocks refine
+                        if i == 0:
+                            x = self._inject_text(x, inject_mask_embeds[inx - 1], inx)
+
+                    # Upsample (PatchExpand) if present
+                    if layer_up.upsample is not None:
+                        y = layer_up.upsample(x)
+                    else:
+                        y = x
 
             x = self.norm_up(y)
+            return x
+        else:
+            # Deep supervision path
+            x_upsample = []
+            for inx, layer_up in enumerate(self.layers_up):
+                if inx == 0:
+                    # Stage 0: PatchExpand only (no Mamba blocks, no text injection)
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])
+                    x = skip_feat.permute(0, 2, 3, 1).contiguous()
+                    y = layer_up(x)  # PatchExpand: 512 -> 256ch
+                    x_upsample.append(self.norm_ds[inx](y))
+                else:
+                    # Stages 1-3: DSEB skip + block0 + inject + remaining blocks + upsample
+                    skip_feat = self.input_projs[3 - inx](inputs[3 - inx])
+                    B, C, H, W = skip_feat.shape
+                    y_interp = F.interpolate(
+                        y.permute(0, 3, 1, 2).contiguous(),
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    # DSEB skip connection
+                    x_chw = self.dseb_blocks[inx - 1](skip=skip_feat, dec=y_interp)
+                    x = x_chw.permute(0, 2, 3, 1).contiguous()
 
+                    # Run Mamba blocks with text injection after the first block
+                    for i, blk in enumerate(layer_up.blocks):
+                        if layer_up.use_checkpoint:
+                            x = checkpoint.checkpoint(blk, x)
+                        else:
+                            x = blk(x)
+                        # Inject after first block so remaining blocks refine
+                        if i == 0:
+                            x = self._inject_text(x, inject_mask_embeds[inx - 1], inx)
+
+                    # Collect DS features after all blocks (before upsample)
+                    if inx != self.num_layers - 1:
+                        x_upsample.append(self.norm_ds[inx](x))
+
+                    # Upsample (PatchExpand) if present
+                    if layer_up.upsample is not None:
+                        y = layer_up.upsample(x)
+                    else:
+                        y = x
+
+            x = self.norm_up(y)
             return x, x_upsample
 
-    def forward(self, inputs):
+    def forward(self, inputs, inject_mask_embeds):
+        """
+        Args:
+            inputs: list of encoder features [shallowest to deepest]
+            inject_mask_embeds: list of 3 projected mask embeddings for stages 1-3
+        Returns:
+            if deep_supervision:
+                (main_logits, ds0, ds1, ds2) each [B, num_classes, H, W]
+            else:
+                logits [B, num_classes, H, W]
+        """
         if not self.deep_supervision:
-            x = self.forward_up_features(inputs)  # B, H, W, C
+            x = self.forward_up_features(inputs, inject_mask_embeds)  # B, H, W, C
             x_last = self.up_x4(x, self.patch_size)
             return x_last
         else:
-            x, x_upsample = self.forward_up_features(inputs)
+            x, x_upsample = self.forward_up_features(inputs, inject_mask_embeds)
             x_last = self.up_x4(x, self.patch_size)
-            x_output_0 = self.output_ds[0](
-                F.interpolate(
-                    x_upsample[0].permute(0, 3, 1, 2).contiguous(),
-                    scale_factor=16,
-                    mode="bilinear",
-                    align_corners=False,
+
+            # Apply DS segmentation heads and upsample to full resolution
+            target_h = self.patches_resolution[0] * self.patch_size
+            target_w = self.patches_resolution[1] * self.patch_size
+            ds_outs = []
+            for i, x_ds in enumerate(x_upsample):
+                x_ds_bchw = x_ds.permute(0, 3, 1, 2).contiguous()
+                ds_out = self.output_ds[i](x_ds_bchw)  # Conv2d: C_i -> num_classes
+                ds_out = F.interpolate(
+                    ds_out, size=(target_h, target_w),
+                    mode="bilinear", align_corners=False
                 )
-            )
-            x_output_1 = self.output_ds[1](
-                F.interpolate(
-                    x_upsample[1].permute(0, 3, 1, 2).contiguous(),
-                    scale_factor=8,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            )
-            x_output_2 = self.output_ds[2](
-                F.interpolate(
-                    x_upsample[2].permute(0, 3, 1, 2).contiguous(),
-                    scale_factor=4,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            )
-            return x_last, x_output_0, x_output_1, x_output_2
+                ds_outs.append(ds_out)
+
+            return (x_last,) + tuple(ds_outs)
 
     def up_x4(self, x, pz):
         B, H, W, C = x.shape

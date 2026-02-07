@@ -3,21 +3,24 @@ P2Echo: Text-conditioned echocardiography segmentation.
 
 This is the main model that integrates:
 - Encoder: PVT-v2-B2 (pretrained vision transformer)
-- Text conditioning: Optimized transformer cross-attention
-- Decoder: DGDecoder (Dual-Gate Mamba + Conv)
+- Text conditioning: Transformer with self-attention + cross-attention
+- Decoder: DGDecoder (Dual-Gate Mamba + Conv) with text injection
 
 Architecture overview:
     Image [B,3,H,W] → PVT-v2-B2 → Multi-scale features
                                       ↓
     Text prompts → Qwen → [B,N,1024] → Project → [N,B,384]
                                                     ↓
-    Bottleneck features [512ch] → Project → [HW,B,384] → Cross-Attention
-                                                              ↓
-                                                    Mask embeddings [B,N,384]
-                                                              ↓
-                                                    Project → [B,N,64]
-                                                              ↓
-    Multi-scale features → DGDecoder → Features [B,64,H,W] → einsum → [B,N,H,W]
+    Bottleneck features [512ch] → Project → [HW,B,384]
+                                                    ↓
+                                    Self-Attn (prompts interact) → Cross-Attn → FFN
+                                                    ↓
+                                          Mask embeddings [B,N,384]
+                                                    ↓
+                                          Per-stage projections → [B,N,256], [B,N,128], [B,N,64]
+                                                    ↓
+    Multi-scale features → DGDecoder (all N embeddings injected at stages 1-3)
+                            ↓ Seg heads: Conv2d → [B, num_classes, H, W] logits
 """
 
 from __future__ import annotations
@@ -26,7 +29,6 @@ from typing import List, Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from positional_encodings.torch_encodings import PositionalEncoding2D
 
@@ -42,11 +44,9 @@ class P2Echo(nn.Module):
     Uses text prompts to guide segmentation of cardiac structures.
     Each prompt (e.g., "Segment the left ventricle") produces a binary mask.
     
-    Optimized configuration (vs original P2Echo):
-    - Query dim: 384 (vs 864 original) 
-    - 3 transformer layers (vs 6 original)
-    - 6 attention heads (vs 8 original)
-    - Single linear projections (vs 2-layer MLPs)
+    All N prompt embeddings are injected simultaneously into the decoder, allowing
+    them to interact via the attention-weighted aggregation in _inject_text.
+    The decoder runs once and outputs [B, num_classes, H, W] directly.
     
     Args:
         input_channels: Number of input image channels (default: 3 for RGB)
@@ -59,6 +59,7 @@ class P2Echo(nn.Module):
         query_dim: Cross-attention query dimension (default: 384)
         transformer_layers: Number of transformer decoder layers (default: 3)
         transformer_heads: Number of attention heads (default: 6)
+        num_classes: Number of segmentation classes (output channels)
         decoder_depths: Number of blocks per decoder stage
         deep_supervision: Return multi-scale outputs for deep supervision loss
         drop_path_rate: Stochastic depth rate
@@ -69,8 +70,8 @@ class P2Echo(nn.Module):
             where N = number of prompts, D = text_embedding_dim
         
     Output:
-        if deep_supervision: tuple of [B, N, H_i, W_i] at multiple scales
-        else: [B, N, H, W] segmentation logits
+        if deep_supervision: tuple of [B, num_classes, H, W] at multiple scales
+        else: [B, num_classes, H, W] segmentation logits
     """
     
     def __init__(
@@ -82,13 +83,14 @@ class P2Echo(nn.Module):
         pretrained_encoder: bool = True,
         freeze_encoder: bool = False,
         pretrained_dir: str = ".",
-        # Text conditioning config (original P2Echo settings)
+        # Text conditioning config
         text_embedding_dim: int = 1024,  # Qwen3-Embedding-0.6B
-        query_dim: int = 864,  # Original P2Echo (was 384)
-        transformer_layers: int = 6,  # Original P2Echo (was 3)
-        transformer_heads: int = 8,  # Original P2Echo (was 6)
-        transformer_ffn_dim: int = 2048,  # Original P2Echo (was 1024)
+        query_dim: int = 256,            # Standard (SAM, Mask2Former, DETR)
+        transformer_layers: int = 3,     # Lightweight prompt decoder
+        transformer_heads: int = 8,      # 32 dim/head
+        transformer_ffn_dim: int = 1024,  # 4x query_dim (standard ratio)
         # Decoder config
+        num_classes: int = 6,
         decoder_depths: Tuple[int, ...] = (4, 2, 1, 1),
         decoder_embed_dim: int = 64,
         deep_supervision: bool = True,
@@ -97,6 +99,7 @@ class P2Echo(nn.Module):
         super().__init__()
         
         self.img_size = img_size
+        self.num_classes = num_classes
         self.deep_supervision = deep_supervision
         self.query_dim = query_dim
         self.decoder_embed_dim = decoder_embed_dim
@@ -145,12 +148,21 @@ class P2Echo(nn.Module):
             norm=nn.LayerNorm(query_dim),
         )
         
-        # Project mask embeddings to decoder output dimension for final einsum
-        self.project_mask_embed = nn.Sequential(
-            nn.Linear(query_dim, query_dim // 2),
-            nn.GELU(),
-            nn.Linear(query_dim // 2, decoder_embed_dim),
-        )
+        # Mask embedding projections for text injection (stages 1-3 only, not stage 0)
+        # Stage 0 is PatchExpand only (no Mamba blocks), so no injection there.
+        # Pre-upsample channel dims for stages 1-3:
+        #   Stage 1: embed_dim * 2^(n-1-1)  = 256
+        #   Stage 2: embed_dim * 2^(n-1-2)  = 128
+        #   Stage 3: embed_dim              = 64
+        num_decoder_stages = len(decoder_depths)
+        self.inject_mask_projs = nn.ModuleList()
+        for i in range(1, num_decoder_stages):  # stages 1, 2, 3
+            ch = int(decoder_embed_dim * 2 ** (num_decoder_stages - 1 - i))
+            self.inject_mask_projs.append(nn.Sequential(
+                nn.Linear(query_dim, query_dim // 2),
+                nn.GELU(),
+                nn.Linear(query_dim // 2, ch),
+            ))
         
         # =====================================================================
         # Decoder: DGDecoder (Dual-Gate Mamba + Conv)
@@ -161,15 +173,12 @@ class P2Echo(nn.Module):
         self.decoder = DGDecoder(
             img_size=list(img_size),
             in_channels=decoder_in_channels,
-            num_classes=decoder_embed_dim,  # Output features, not class logits
+            num_classes=num_classes,
             embed_dim=decoder_embed_dim,
             depths=list(decoder_depths),
             drop_path_rate=drop_path_rate,
             deep_supervision=deep_supervision,
         )
-        
-        # Note: DGDecoder's output_ds layers already project intermediate features
-        # to num_classes (decoder_embed_dim), so no additional projection needed.
         
         self._init_weights()
     
@@ -196,11 +205,12 @@ class P2Echo(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
                     
-        for m in self.project_mask_embed.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        for proj in self.inject_mask_projs:
+            for m in proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(
         self, 
@@ -218,14 +228,11 @@ class P2Echo(nn.Module):
             
         Returns:
             if deep_supervision:
-                Tuple of (main_output, ds_output_0, ds_output_1, ds_output_2)
-                Each is [B, N, H_i, W_i] logits
+                Tuple of (main_logits, ds0, ds1, ds2)
+                Each is [B, num_classes, H, W] logits
             else:
-                [B, N, H, W] segmentation logits
+                [B, num_classes, H, W] segmentation logits
         """
-        B = img.shape[0]
-        N = text_embedding.shape[1]  # Number of prompts
-        
         # =====================================================================
         # 1. Encoder: Extract multi-scale features
         # =====================================================================
@@ -233,9 +240,8 @@ class P2Echo(nn.Module):
         # encoder_features: [f1, f2, f3, f4] = [(B,64,H/4,W/4), ..., (B,512,H/32,W/32)]
         
         # =====================================================================
-        # 2. Text-Image Cross-Attention
+        # 2. Text-Image Cross-Attention (with self-attention among prompts)
         # =====================================================================
-        # Use deepest features (512ch, 8x8) for cross-attention
         bottleneck = encoder_features[-1]  # [B, 512, H/32, W/32]
         
         # Project bottleneck: [B, 512, h, w] -> [B, h, w, 384] -> [hw, B, 384]
@@ -244,13 +250,12 @@ class P2Echo(nn.Module):
         bottleneck_embed = rearrange(bottleneck_embed, "b h w c -> (h w) b c")
         
         # Project text: [B, N, D] -> [N, B, 384]
-        # Handle potential extra dimension from some text encoders
         if text_embedding.ndim == 4:
             text_embedding = text_embedding.squeeze(2)
         text_embed = rearrange(text_embedding, "b n d -> n b d")
         text_embed = self.project_text(text_embed)
         
-        # Cross-attention: text queries attend to image features
+        # Self-attention among prompts + cross-attention to image features
         mask_embedding, _ = self.transformer_decoder(
             tgt=text_embed,           # [N, B, 384] - queries
             memory=bottleneck_embed,  # [HW, B, 384] - keys/values
@@ -258,42 +263,17 @@ class P2Echo(nn.Module):
         )
         # mask_embedding: [N, B, 384]
         
-        # Rearrange and project to decoder dimension
-        mask_embedding = rearrange(mask_embedding, "n b c -> b n c")  # [B, N, 384]
-        mask_embedding = self.project_mask_embed(mask_embedding)      # [B, N, 64]
+        # Rearrange to [B, N, query_dim] for per-stage projection
+        mask_embedding = rearrange(mask_embedding, "n b c -> b n c")  # [B, N, query_dim]
+        
+        # Project mask embeddings for injection at decoder stages 1-3
+        inject_mask_embeds = [proj(mask_embedding) for proj in self.inject_mask_projs]
+        # [B,N,256], [B,N,128], [B,N,64] for default config
         
         # =====================================================================
-        # 3. Decoder: Upsample features
+        # 3. Decoder: Single pass with all N embeddings injected together
         # =====================================================================
-        # DGDecoder expects features in order [shallowest to deepest]
-        # encoder_features is [f1, f2, f3, f4] already in this order
-        decoder_out = self.decoder(encoder_features)
-        
-        # =====================================================================
-        # 4. Text-conditioned Output via Einsum
-        # =====================================================================
-        if self.deep_supervision:
-            # decoder_out: (main, ds0, ds1, ds2)
-            # All outputs have shape [B, embed_dim, H, W] (decoder already projects to num_classes)
-            main_feat, ds0, ds1, ds2 = decoder_out
-            
-            # Main output: einsum fusion
-            # main_feat: [B, 64, H, W], mask_embedding: [B, N, 64]
-            main_out = torch.einsum("b c h w, b n c -> b n h w", main_feat, mask_embedding)
-            
-            # Deep supervision outputs: direct einsum (already projected by decoder)
-            ds_outs = []
-            for ds_feat in [ds0, ds1, ds2]:
-                # ds_feat: [B, embed_dim, H, W]
-                ds_out = torch.einsum("b c h w, b n c -> b n h w", ds_feat, mask_embedding)
-                ds_outs.append(ds_out)
-            
-            return (main_out,) + tuple(ds_outs)
-        else:
-            # decoder_out: [B, embed_dim, H, W]
-            # einsum: [B, C, H, W] x [B, N, C] -> [B, N, H, W]
-            output = torch.einsum("b c h w, b n c -> b n h w", decoder_out, mask_embedding)
-            return output
+        return self.decoder(encoder_features, inject_mask_embeds)
 
     def get_encoder_params(self):
         """Get encoder parameters (for separate learning rate)."""
@@ -309,13 +289,14 @@ class P2Echo(nn.Module):
         params.extend(self.project_bottleneck.parameters())
         params.extend(self.project_text.parameters())
         params.extend(self.transformer_decoder.parameters())
-        params.extend(self.project_mask_embed.parameters())
-        # Note: ds_projs removed - decoder handles projection internally
+        for proj in self.inject_mask_projs:
+            params.extend(proj.parameters())
         return params
 
 
 def build_p2echo(
     img_size: Tuple[int, int] = (256, 256),
+    num_classes: int = 6,
     pretrained_encoder: bool = True,
     pretrained_dir: str = ".",
     text_embedding_dim: int = 1024,
@@ -326,6 +307,7 @@ def build_p2echo(
     
     Args:
         img_size: Input image size
+        num_classes: Number of segmentation classes (output channels)
         pretrained_encoder: Load pretrained PVT-v2-B2 weights
         pretrained_dir: Directory containing pretrained weights
         text_embedding_dim: Text embedding dimension (1024 for Qwen-0.6B)
@@ -335,7 +317,7 @@ def build_p2echo(
         P2Echo model instance
         
     Example:
-        >>> model = build_p2echo(pretrained_dir="/path/to/pretrained_pth")
+        >>> model = build_p2echo(num_classes=6, pretrained_dir="/path/to/pretrained_pth")
         >>> img = torch.randn(2, 3, 256, 256)
         >>> text_emb = torch.randn(2, 6, 1024)  # 6 prompts
         >>> out = model(img, text_emb)
@@ -354,6 +336,7 @@ def build_p2echo(
         transformer_layers=3,
         transformer_heads=6,
         transformer_ffn_dim=1024,
+        num_classes=num_classes,
         decoder_depths=(4, 2, 1, 1),
         decoder_embed_dim=64,
         deep_supervision=deep_supervision,
