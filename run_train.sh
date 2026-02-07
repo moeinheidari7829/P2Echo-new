@@ -74,14 +74,14 @@ python src/train.py \
     --run_name "${RUN_NAME}" \
     --image_size 256 \
     --batch_size 32 \
-    --num_workers 4 \
+    --num_workers 16 \
     --pretrained_encoder \
     --pretrained_dir "./pretrained_pth" \
     --text_model "${TEXT_MODEL}" \
     --text_cache_dir "${HF_HOME}/hub" \
     --epochs 200 \
     --optimizer sgd \
-    --lr 0.05 \
+    --lr 0.01 \
     --momentum 0.9 \
     --weight_decay 1e-4 \
     --grad_clip 1.0 \

@@ -4,7 +4,7 @@ P2Echo: Text-conditioned echocardiography segmentation.
 This is the main model that integrates:
 - Encoder: PVT-v2-B2 (pretrained vision transformer)
 - Text conditioning: Transformer with self-attention + cross-attention
-- Decoder: DGDecoder (Dual-Gate Mamba + Conv) with text injection
+- Decoder: CENet-style decoder with text injection
 
 Architecture overview:
     Image [B,3,H,W] → PVT-v2-B2 → Multi-scale features
@@ -17,9 +17,9 @@ Architecture overview:
                                                     ↓
                                           Mask embeddings [B,N,384]
                                                     ↓
-                                          Per-stage projections → [B,N,256], [B,N,128], [B,N,64]
+                                          Per-stage projections → [B,N,320], [B,N,128], [B,N,64]
                                                     ↓
-    Multi-scale features → DGDecoder (all N embeddings injected at stages 1-3)
+    Multi-scale features → CENetDecoder (all N embeddings injected at stages 1-3)
                             ↓ Seg heads: Conv2d → [B, num_classes, H, W] logits
 """
 
@@ -33,7 +33,7 @@ from einops import rearrange
 from positional_encodings.torch_encodings import PositionalEncoding2D
 
 from .encoder import get_encoder2d
-from .decoders import DGDecoder
+from .decoders import CENetDecoder
 from .transformer import TransformerDecoder, TransformerDecoderLayer
 
 
@@ -148,37 +148,30 @@ class P2Echo(nn.Module):
             norm=nn.LayerNorm(query_dim),
         )
         
-        # Mask embedding projections for text injection (stages 1-3 only, not stage 0)
-        # Stage 0 is PatchExpand only (no Mamba blocks), so no injection there.
-        # Pre-upsample channel dims for stages 1-3:
-        #   Stage 1: embed_dim * 2^(n-1-1)  = 256
-        #   Stage 2: embed_dim * 2^(n-1-2)  = 128
-        #   Stage 3: embed_dim              = 64
-        num_decoder_stages = len(decoder_depths)
+        # Mask embedding projections for text injection at decoder stages 1-3.
+        # With CENet decoder channels [512, 320, 128, 64], injected stages are:
+        #   Stage 1: 320, Stage 2: 128, Stage 3: 64.
+        decoder_in_channels = encoder_channels  # deepest -> shallowest
         self.inject_mask_projs = nn.ModuleList()
-        for i in range(1, num_decoder_stages):  # stages 1, 2, 3
-            ch = int(decoder_embed_dim * 2 ** (num_decoder_stages - 1 - i))
+        for ch in decoder_in_channels[1:]:
             self.inject_mask_projs.append(nn.Sequential(
                 nn.Linear(query_dim, query_dim // 2),
                 nn.GELU(),
-                nn.Linear(query_dim // 2, ch),
+                nn.Linear(query_dim // 2, int(ch)),
             ))
         
         # =====================================================================
-        # Decoder: DGDecoder (Dual-Gate Mamba + Conv)
+        # Decoder: CENet-style decoder + text injection
         # =====================================================================
-        # Decoder expects in_channels in order [shallowest to deepest]
-        decoder_in_channels = encoder_channels[::-1]  # [64, 128, 320, 512]
-        
-        self.decoder = DGDecoder(
-            img_size=list(img_size),
-            in_channels=decoder_in_channels,
+        self.decoder = CENetDecoder(
+            channels=decoder_in_channels, 
+            scale_factors=[0.8,0.4],
+            skip_mode='add',
+            num_heads=[2,2,2],
+            up_block='eucb',
             num_classes=num_classes,
-            embed_dim=decoder_embed_dim,
-            depths=list(decoder_depths),
-            drop_path_rate=drop_path_rate,
-            deep_supervision=deep_supervision,
-        )
+            writer=None)
+        
         
         self._init_weights()
     
@@ -268,7 +261,7 @@ class P2Echo(nn.Module):
         
         # Project mask embeddings for injection at decoder stages 1-3
         inject_mask_embeds = [proj(mask_embedding) for proj in self.inject_mask_projs]
-        # [B,N,256], [B,N,128], [B,N,64] for default config
+        # [B,N,320], [B,N,128], [B,N,64] for PVT-v2-B2 channels
         
         # =====================================================================
         # 3. Decoder: Single pass with all N embeddings injected together
