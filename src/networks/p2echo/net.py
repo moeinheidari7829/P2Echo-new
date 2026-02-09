@@ -33,7 +33,7 @@ from einops import rearrange
 from positional_encodings.torch_encodings import PositionalEncoding2D
 
 from .encoder import get_encoder2d
-from .decoders import CENetDecoder
+from .decoders import CENetDecoder, DyITADecoder
 from .transformer import TransformerDecoder, TransformerDecoderLayer
 
 
@@ -91,10 +91,20 @@ class P2Echo(nn.Module):
         transformer_ffn_dim: int = 1024,  # 4x query_dim (standard ratio)
         # Decoder config
         num_classes: int = 6,
+        decoder_type: str = "cenet",  # "cenet" or "ita"
         decoder_depths: Tuple[int, ...] = (4, 2, 1, 1),
         decoder_embed_dim: int = 64,
         deep_supervision: bool = True,
         drop_path_rate: float = 0.1,
+        # DyITA decoder hyperparameters (only used when decoder_type="ita")
+        ita_n_heads: Tuple[int, ...] = (2, 2, 2),
+        ita_n_projectors: int = 3,
+        ita_n_kernel_factors: int = 9,
+        ita_n_diff_factors: int = 9,
+        ita_ffn_ratio: float = 4.0,
+        ita_gamma_init: float = 3.0,
+        ita_lambda_init: float = 0.01,
+        ita_dual_injection: bool = False,
     ) -> None:
         super().__init__()
         
@@ -103,6 +113,7 @@ class P2Echo(nn.Module):
         self.deep_supervision = deep_supervision
         self.query_dim = query_dim
         self.decoder_embed_dim = decoder_embed_dim
+        self.decoder_type = decoder_type
         
         # =====================================================================
         # Encoder: PVT-v2-B2
@@ -161,16 +172,33 @@ class P2Echo(nn.Module):
             ))
         
         # =====================================================================
-        # Decoder: CENet-style decoder + text injection
+        # Decoder: CENet-style or DyITA decoder
         # =====================================================================
-        self.decoder = CENetDecoder(
-            channels=decoder_in_channels, 
-            scale_factors=[0.8,0.4],
-            skip_mode='add',
-            num_heads=[2,2,2],
-            up_block='eucb',
-            num_classes=num_classes,
-            writer=None)
+        if decoder_type == "ita":
+            self.decoder = DyITADecoder(
+                channels=decoder_in_channels,
+                up_block='eucb',
+                num_classes=num_classes,
+                n_heads=list(ita_n_heads),
+                n_projectors=ita_n_projectors,
+                n_kernel_factors=ita_n_kernel_factors,
+                n_diff_factors=ita_n_diff_factors,
+                ffn_ratio=ita_ffn_ratio,
+                drop_path_rate=drop_path_rate,
+                gamma_init=ita_gamma_init,
+                lambda_init=ita_lambda_init,
+                dual_injection=ita_dual_injection,
+                deep_supervision=deep_supervision,
+            )
+        else:
+            self.decoder = CENetDecoder(
+                channels=decoder_in_channels, 
+                scale_factors=[0.8,0.4],
+                skip_mode='add',
+                num_heads=[2,2,2],
+                up_block='eucb',
+                num_classes=num_classes,
+                writer=None)
         
         
         self._init_weights()
@@ -294,6 +322,8 @@ def build_p2echo(
     pretrained_dir: str = ".",
     text_embedding_dim: int = 1024,
     deep_supervision: bool = True,
+    decoder_type: str = "cenet",
+    ita_dual_injection: bool = False,
 ) -> P2Echo:
     """
     Build P2Echo model with default configuration.
@@ -330,8 +360,10 @@ def build_p2echo(
         transformer_heads=6,
         transformer_ffn_dim=1024,
         num_classes=num_classes,
+        decoder_type=decoder_type,
         decoder_depths=(4, 2, 1, 1),
         decoder_embed_dim=64,
         deep_supervision=deep_supervision,
         drop_path_rate=0.1,
+        ita_dual_injection=ita_dual_injection,
     )

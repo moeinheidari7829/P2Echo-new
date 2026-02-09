@@ -2,3 +2,4 @@
 from .DGDecoder import DGDecoder, DualGateDecoderBlock, Mamba_up
 from .MambaDecoder import PatchExpand, UpsampleExpand, FinalUpsample_X4
 from .CENetDecoder import CENetDecoder
+from .ITADecoder import DyITADecoder

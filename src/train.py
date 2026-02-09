@@ -807,6 +807,10 @@ def main():
     parser.add_argument("--pretrained_dir", type=str, default="./pretrained_pth")
     parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--text_cache_dir", type=str, default="/project/def-ilkerh/moeinh78/.cache/huggingface/hub/")
+    parser.add_argument("--decoder_type", type=str, default="cenet", choices=["cenet", "ita"],
+                        help="Decoder type: 'cenet' (original) or 'ita' (DyITA decoder)")
+    parser.add_argument("--ita_dual_injection", action="store_true",
+                        help="DyITA: also apply post-hoc text injection after ITABlock (ablation)")
     
     # Training
     parser.add_argument("--epochs", type=int, default=200)
@@ -892,6 +896,8 @@ def main():
         text_embedding_dim=text_backbone.embedding_dim,
         num_classes=num_classes,
         deep_supervision=True,
+        decoder_type=args.decoder_type,
+        ita_dual_injection=args.ita_dual_injection,
     )
     model = model.to(device)
     

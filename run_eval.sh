@@ -1,27 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=P2Echo-new
+#SBATCH --job-name=P2Echo-eval
 #SBATCH --account=def-ilkerh
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --time=23:59:00
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
 #SBATCH --gpus-per-node=h100:1
-#SBATCH --output=/scratch/moeinh78/P2Echo-new/logs/output-%j.txt
-#SBATCH --error=/scratch/moeinh78/P2Echo-new/logs/error-%j.txt
-
-set -euo pipefail
+#SBATCH --output=/scratch/moeinh78/P2Echo-new/logs/eval-output-%j.txt
+#SBATCH --error=/scratch/moeinh78/P2Echo-new/logs/eval-error-%j.txt
 
 # ============================================================================
-# P2Echo-new Training Script
+# P2Echo-new Evaluation Script — External Split
 # ============================================================================
 
 cd /scratch/moeinh78/P2Echo-new
 mkdir -p logs
 
 # Activate environment
-source ~/envs/sam3/bin/activate
+source ~/envs/sam3/bin/activate || true
 
-nvidia-smi
+nvidia-smi || true
 
 # Fix matplotlib/fontconfig cache directory issues
 export XDG_CONFIG_HOME=/scratch/moeinh78/P2Echo-new/.config
@@ -30,7 +28,7 @@ export MPLCONFIGDIR=${XDG_CONFIG_HOME}/matplotlib
 export FONTCONFIG_CACHE=${XDG_CACHE_HOME}/fontconfig
 mkdir -p "$MPLCONFIGDIR" "$FONTCONFIG_CACHE"
 
-# Triton cache (torch.compile, flash-attn, etc.)
+# Triton cache
 export TRITON_CACHE_DIR=/scratch/moeinh78/P2Echo-new/.triton_cache
 mkdir -p "$TRITON_CACHE_DIR"
 
@@ -40,58 +38,44 @@ export TRANSFORMERS_CACHE=${HF_HOME}/hub
 export SAM3_DATA_ROOT=/project/def-ilkerh/moeinh78/data
 export SAM3_SPLITS_JSON=${SAM3_DATA_ROOT}/data_splits.json
 
-# Force fully offline mode - uses cached files only
+# Force fully offline mode
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-# PYTHONPATH for imports
-
-# Control CPU thread usage (prevents libgomp thread failures)
+# CPU thread control
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
 
 # ============================================================================
-# Training Configuration
+# Evaluation Configuration
 # ============================================================================
 
-RUN_NAME=${RUN_NAME:-"p2echo_dyita"}
-TEXT_MODEL=${TEXT_MODEL:-"Qwen/Qwen3-Embedding-0.6B"}
+CHECKPOINT="./outputs/p2echo_v2_small_transformer_boundary_loss/checkpoints/best.pth"
+OUTPUT_DIR="./outputs/eval_external"
+TEXT_MODEL="Qwen/Qwen3-Embedding-0.6B"
 
 echo "=============================================="
-echo "[INFO] Starting P2Echo-new training..."
-echo "  run_name: ${RUN_NAME}"
-echo "  text_model: ${TEXT_MODEL}"
+echo "[INFO] Starting P2Echo-new evaluation..."
+echo "  checkpoint: ${CHECKPOINT}"
+echo "  output_dir: ${OUTPUT_DIR}"
 echo "=============================================="
 
-# Run training
-python src/train.py \
+python src/evaluate.py \
+    --checkpoint "${CHECKPOINT}" \
     --splits_json "${SAM3_SPLITS_JSON}" \
     --data_root "${SAM3_DATA_ROOT}" \
-    --output_dir "./outputs" \
-    --run_name "${RUN_NAME}" \
-    --decoder_type "dyita" \
-    --image_size 256 \
-    --batch_size 32 \
-    --num_workers 16 \
-    --pretrained_encoder \
-    --pretrained_dir "./pretrained_pth" \
     --text_model "${TEXT_MODEL}" \
-    --text_cache_dir "${HF_HOME}/hub" \
-    --epochs 200 \
-    --optimizer sgd \
-    --lr 0.01 \
-    --momentum 0.9 \
-    --weight_decay 1e-4 \
-    --grad_clip 1.0 \
-    --aug_clip 1.5 \
-    --loss_type boundary \
+    --output_dir "${OUTPUT_DIR}" \
+    --image_size 256 \
+    --batch_size 16 \
+    --num_workers 8 \
+    --pretrained_dir "./pretrained_pth" \
     --use_amp \
     --bf16 \
-    --save_interval 10 \
-    --val_interval 1 \
+    --max_qual 10 \
+    --threshold 0.5 \
     --seed 42 \
     "$@"
-
