@@ -133,7 +133,7 @@ class DyITADecoder(nn.Module):
             ffn_ratio=ffn_ratio,
             drop_rate=0.0,
             drop_path_rate=drop_path_rate,
-            init_value=1e-2,  # NOTE: 1e-6 kills text gradients (see ITABlock docstring)
+            init_value=0.1,  # Higher init for faster text gradient propagation
             n_projectors=n_projectors,
             n_kernel_factors=n_kernel_factors,
             n_diff_factors=n_diff_factors,

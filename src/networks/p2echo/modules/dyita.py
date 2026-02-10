@@ -228,20 +228,34 @@ class TokenDifferentialOperator(nn.Module):
     Per-token λ values are selected from a learnable bank via routing.
     λ initialized to 0.01 (small to prevent over-differencing early in training).
 
+    Supports hybrid attention:
+    - Softmax attention for small N (more expressive, O(S*N) complexity)
+    - Linear attention for large N (more efficient, O(S*d) complexity)
+
     Args:
         dim: token feature dimension (concatenated Q+Q' dim for routing, = 2*head_dim).
+        head_dim: per-head dimension for attention scaling.
         n_diff_factors: number of learnable λ values (default: 9, "Small").
         lambda_init: initial value for all λ (default: 0.01).
+        softmax_threshold: use softmax attention when N <= this value (default: 16).
+        use_softmax: force softmax attention regardless of N (default: False).
     """
 
     def __init__(
         self,
         dim: int,
+        head_dim: int = 64,
         n_diff_factors: int = 9,
         lambda_init: float = 0.01,
+        softmax_threshold: int = 16,
+        use_softmax: bool = False,
     ) -> None:
         super().__init__()
         self.n_diff_factors = n_diff_factors
+        self.head_dim = head_dim
+        self.softmax_threshold = softmax_threshold
+        self.use_softmax = use_softmax
+        self.scale = head_dim ** -0.5
         # Learnable λ values — small init prevents over-differencing
         self.lambdas = nn.Parameter(torch.full((n_diff_factors,), lambda_init))
         # Routers for Q-side and K-side λ selection
@@ -260,11 +274,16 @@ class TokenDifferentialOperator(nn.Module):
         V: torch.Tensor,         # [B, heads, N, hd]
     ) -> torch.Tensor:
         """
-        Token-wise differential paradigm (efficient: 2 matmuls).
+        Token-wise differential paradigm with hybrid attention.
+
+        Uses softmax attention when N is small (more expressive for few prompts),
+        linear attention when N is large (more efficient for many tokens).
 
         Returns:
             O: [B, heads, S, hd]
         """
+        N = K_t.shape[2]  # Number of key/value tokens (prompts)
+        
         # Concatenate for routing
         Q_cat = torch.cat([Q_t, Q_prime_t], dim=-1)    # [B, heads, S, 2*hd]
         K_cat = torch.cat([K_t, K_prime_t], dim=-1)    # [B, heads, N, 2*hd]
@@ -283,10 +302,18 @@ class TokenDifferentialOperator(nn.Module):
         Q_diff = Q_t - lambda_q * Q_prime_t            # [B, heads, S, hd]
         K_diff = K_t - lambda_k * K_prime_t            # [B, heads, N, hd]
 
-        # Linear attention: O = Q_diff · (K_diff^T V)
-        # K_diff^T V: [B, heads, hd, hd]  (key-value outer product aggregated)
-        KV = torch.matmul(K_diff.transpose(-2, -1), V)  # [B, heads, hd, hd]
-        O = torch.matmul(Q_diff, KV)                     # [B, heads, S, hd]
+        # Choose attention type based on N
+        if self.use_softmax or N <= self.softmax_threshold:
+            # Softmax attention: more expressive for small N
+            # attn = softmax(Q @ K.T / sqrt(d)) @ V
+            attn_scores = torch.matmul(Q_diff, K_diff.transpose(-2, -1)) * self.scale  # [B, heads, S, N]
+            attn_weights = F.softmax(attn_scores, dim=-1)  # [B, heads, S, N]
+            O = torch.matmul(attn_weights, V)              # [B, heads, S, hd]
+        else:
+            # Linear attention: O = Q_diff · (K_diff^T V)
+            # More efficient for large N: O(S*d*d) instead of O(S*N*d)
+            KV = torch.matmul(K_diff.transpose(-2, -1), V)  # [B, heads, hd, hd]
+            O = torch.matmul(Q_diff, KV)                     # [B, heads, S, hd]
 
         return O
 
@@ -354,6 +381,7 @@ class DyITAModule(nn.Module):
         # 3. Token Differential Operator
         self.tdo = TokenDifferentialOperator(
             dim=2 * self.head_dim,  # concat(Q̃, Q̃') dim
+            head_dim=self.head_dim,
             n_diff_factors=n_diff_factors,
             lambda_init=lambda_init,
         )
@@ -558,7 +586,7 @@ class ITABlock(nn.Module):
         ffn_ratio: float = 4.0,
         drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
-        init_value: float = 1e-2,
+        init_value: float = 0.1,
         # DyITA hyperparameters
         n_projectors: int = 3,
         n_kernel_factors: int = 9,

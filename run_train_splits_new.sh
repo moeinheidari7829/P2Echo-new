@@ -38,7 +38,7 @@ mkdir -p "$TRITON_CACHE_DIR"
 export HF_HOME=/project/def-ilkerh/moeinh78/.cache/huggingface
 export TRANSFORMERS_CACHE=${HF_HOME}/hub
 export SAM3_DATA_ROOT=/project/def-ilkerh/moeinh78/data
-export SAM3_SPLITS_JSON=${SAM3_DATA_ROOT}/data_splits.json
+export SAM3_SPLITS_JSON=${SAM3_SPLITS_JSON:-/project/def-ilkerh/moeinh78/data/data_splits_new.json}
 
 # Force fully offline mode - uses cached files only
 export HF_HUB_OFFLINE=1
@@ -57,13 +57,14 @@ export TOKENIZERS_PARALLELISM=false
 # Training Configuration
 # ============================================================================
 
-RUN_NAME=${RUN_NAME:-"p2echo_dyita"}
+RUN_NAME=${RUN_NAME:-"p2echo_dyita_splits_new"}
 TEXT_MODEL=${TEXT_MODEL:-"Qwen/Qwen3-Embedding-0.6B"}
 
 echo "=============================================="
 echo "[INFO] Starting P2Echo-new training..."
 echo "  run_name: ${RUN_NAME}"
 echo "  text_model: ${TEXT_MODEL}"
+echo "  splits_json: ${SAM3_SPLITS_JSON}"
 echo "=============================================="
 
 # Run training

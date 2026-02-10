@@ -36,7 +36,8 @@ mkdir -p "$TRITON_CACHE_DIR"
 export HF_HOME=/project/def-ilkerh/moeinh78/.cache/huggingface
 export TRANSFORMERS_CACHE=${HF_HOME}/hub
 export SAM3_DATA_ROOT=/project/def-ilkerh/moeinh78/data
-export SAM3_SPLITS_JSON=${SAM3_DATA_ROOT}/data_splits.json
+#export SAM3_SPLITS_JSON=${SAM3_DATA_ROOT}/data_splits.json
+export SAM3_SPLITS_JSON=${SAM3_SPLITS_JSON:-/project/def-ilkerh/moeinh78/data/data_splits_new.json}
 
 # Force fully offline mode
 export HF_HUB_OFFLINE=1
@@ -53,7 +54,7 @@ export TOKENIZERS_PARALLELISM=false
 # Evaluation Configuration
 # ============================================================================
 
-CHECKPOINT="./outputs/p2echo_v2_small_transformer_boundary_loss/checkpoints/best.pth"
+CHECKPOINT="/scratch/moeinh78/P2Echo-new/outputs/p2echo_dyita_splits_new/checkpoints/best.pth"
 OUTPUT_DIR="./outputs/eval_external"
 TEXT_MODEL="Qwen/Qwen3-Embedding-0.6B"
 
@@ -75,6 +76,7 @@ python src/evaluate.py \
     --pretrained_dir "./pretrained_pth" \
     --use_amp \
     --bf16 \
+    --decoder_type "ita" \
     --max_qual 10 \
     --threshold 0.5 \
     --seed 42 \

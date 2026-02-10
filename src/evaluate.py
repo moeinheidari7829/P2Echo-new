@@ -76,6 +76,22 @@ def resolve_hf_local_snapshot(model_id_or_path: str) -> str:
     return str(snaps[0])
 
 
+def infer_decoder_config_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Tuple[str, bool]:
+    """
+    Infer decoder configuration from parameter names in a checkpoint state_dict.
+
+    Returns:
+        (decoder_type, ita_dual_injection)
+    """
+    keys = state_dict.keys()
+    has_dyita = any(".dyita." in k for k in keys)
+    has_inject_convs = any(k.startswith("decoder.inject_convs.") for k in keys)
+
+    if has_dyita:
+        return "ita", has_inject_convs
+    return "cenet", False
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -505,6 +521,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pretrained_dir", type=str, default="./pretrained_pth")
+    parser.add_argument("--decoder_type", type=str, default="auto", choices=["auto", "cenet", "ita"],
+                        help="Decoder type to instantiate. 'auto' infers from checkpoint keys.")
+    parser.add_argument("--ita_dual_injection", action="store_true",
+                        help="For decoder_type=ita: enable post-hoc text injection after ITABlock.")
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--max_qual", type=int, default=10,
@@ -577,7 +597,21 @@ def main():
     # =========================================================================
     # Model
     # =========================================================================
+    _log(f"[{_now()}] Loading checkpoint: {args.checkpoint}", log_path)
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    state_dict = ckpt["model_state_dict"]
+    inferred_decoder_type, inferred_ita_dual = infer_decoder_config_from_state_dict(state_dict)
+    decoder_type = inferred_decoder_type if args.decoder_type == "auto" else args.decoder_type
+    ita_dual_injection = bool(args.ita_dual_injection) or (
+        args.decoder_type == "auto" and inferred_ita_dual
+    )
+
     _log(f"[{_now()}] Building P2Echo model...", log_path)
+    _log(
+        f"[{_now()}] Decoder config: decoder_type={decoder_type}, "
+        f"ita_dual_injection={ita_dual_injection}",
+        log_path,
+    )
     num_classes = len(prompt_specs)
     model = P2Echo(
         input_channels=3,
@@ -588,12 +622,12 @@ def main():
         text_embedding_dim=text_backbone.embedding_dim,
         num_classes=num_classes,
         deep_supervision=True,
+        decoder_type=decoder_type,
+        ita_dual_injection=ita_dual_injection,
     )
 
-    # Load checkpoint
-    _log(f"[{_now()}] Loading checkpoint: {args.checkpoint}", log_path)
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Load checkpoint weights
+    model.load_state_dict(state_dict)
     model = model.to(device)
 
     best_dice = ckpt.get("best_dice", float("nan"))
