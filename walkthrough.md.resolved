@@ -1,0 +1,418 @@
+# P2Echo Architecture with DyITA-NoCFA Decoder — Complete Walkthrough
+
+![P2Echo DyITA-NoCFA Architecture](/home/moeinh78/.gemini/antigravity/brain/cce98b55-0738-47d6-9ff9-a0052628727d/p2echo_nocfa_diagram_1770867297179.png)
+
+---
+
+## 1. High-Level Overview
+
+P2Echo is a **text-conditioned echocardiography segmentation** model. Given an ultrasound image and N=6 text prompts (BG, LV, MYO, LA, RV, RA), it outputs `[B, 6, 256, 256]` segmentation logits.
+
+The **DyITA-NoCFA** variant (`--decoder_type dyITA_NoCFA`) eliminates the CFAModule from CENet, using **ITABlock at all 4 decoder stages** — including the bottleneck. This means text embeddings guide the decoder at every resolution.
+
+### Component Files
+
+| Component | File | Key Class |
+|-----------|------|-----------|
+| Main model | [net.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/net.py) | [P2Echo](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/net.py#40-345) |
+| Image encoder | [pvtv2.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/pvtv2.py) | [PyramidVisionTransformerImpr](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/pvtv2.py#194-357) |
+| Text encoder | [text_encoder.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/text_encoder.py) | [FrozenTextBackbone](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/text_encoder.py#73-197) |
+| Prompt system | [prompts.py](file:///scratch/moeinh78/P2Echo-new/src/prompts.py) | [build_prompt_text()](file:///scratch/moeinh78/P2Echo-new/src/prompts.py#187-275) |
+| Cross-attn transformer | [transformer.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/transformer.py) | [TransformerDecoder](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/transformer.py#25-108) |
+| DyITA-NoCFA decoder | [ITADecoder.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/decoders/ITADecoder.py#L259-L373) | [DyITADecoderNoCFA](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/decoders/ITADecoder.py#259-373) |
+| DyITA module | [dyita.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py) | [DyITAModule](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#325-455), [ITABlock](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#552-661) |
+| Upsampling | [blocks.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/blocks.py) | [EUCB](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/blocks.py#297-322) |
+
+---
+
+## 2. Text Prompt System
+
+**File:** [prompts.py](file:///scratch/moeinh78/P2Echo-new/src/prompts.py)
+
+### 2.1 Label Definitions
+
+```python
+# prompts.py L20-27
+LABEL_TO_ID = {"BG": 0, "LV": 1, "MYO": 2, "LA": 3, "RV": 4, "RA": 5}
+```
+
+### 2.2 View-Aware Prompts
+
+Each prompt is **view-specific** with anatomical descriptions:
+
+```python
+# prompts.py L47-52
+VIEW_TO_STRUCTURES = {
+    "4CH": ("LV", "LA", "RA", "RV", "MYO"),
+    "2CH": ("LV", "LA", "MYO"),
+    "3CH": ("LV", "LA", "MYO"),
+    "PSAX": ("LV", "RV", "MYO"),
+}
+```
+
+**Example prompt** (LV in 4CH):
+> *"Apical 4-Chamber (4CH): Structures visualized: LA, LV, MYO, RA, RV. Segment the LV: The LV appears as a bullet-shaped chamber forming the apex."*
+
+If a structure is **absent** in the current view, the prompt explicitly says:
+> *"The MYO is not visualized in this view; do not segment it. Background only."*
+
+---
+
+## 3. Image Encoder: PVT-v2-B2
+
+**File:** [pvtv2.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/pvtv2.py#L312-L350)
+
+Hierarchical vision transformer with 4 stages. Each stage uses overlapping patch embeddings and spatial reduction attention:
+
+```python
+def forward_features(self, x):  # [B, 3, 256, 256]
+    outs = []
+    # Stage 1: patch_embed → transformer blocks → [B, 64, 64, 64]
+    x, H, W = self.patch_embed1(x)
+    for blk in self.block1: x = blk(x, H, W)
+    outs.append(self.norm1(x).reshape(B, H, W, -1).permute(0,3,1,2))
+
+    # Stage 2: → [B, 128, 32, 32]
+    # Stage 3: → [B, 320, 16, 16]
+    # Stage 4: → [B, 512, 8, 8]
+    ...
+    return outs  # [f1, f2, f3, f4] shallow→deep
+```
+
+| Stage | Shape | Tokens |
+|-------|-------|--------|
+| 1 | `[B, 64, 64, 64]` | 4,096 |
+| 2 | `[B, 128, 32, 32]` | 1,024 |
+| 3 | `[B, 320, 16, 16]` | 256 |
+| 4 | `[B, 512, 8, 8]` | 64 |
+
+---
+
+## 4. Text Encoder: Frozen Qwen3-Embedding-0.6B
+
+**File:** [text_encoder.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/text_encoder.py#L73-L197)
+
+```python
+class FrozenTextBackbone(nn.Module):
+    def __init__(self, model_name="Qwen/Qwen3-Embedding-0.6B"):
+        self.model = AutoModel.from_pretrained(model_name)
+        for p in self.model.parameters():
+            p.requires_grad = False   # ← FROZEN, never trained
+        self.embedding_dim = 1024
+
+    @torch.no_grad()
+    def embed_prompts(self, prompts, device):
+        # 1. Wrap: "Instruct: ...anatomical term query...\nQuery: <prompt>"
+        to_embed = wrap_with_instruction(prompts)
+        # 2. Tokenize + forward through frozen Qwen
+        enc = self.model(**self.tokenizer(to_embed, ...))
+        # 3. Last-token pooling (GPT-style)
+        emb = last_token_pool(enc.last_hidden_state, attention_mask)
+        # 4. L2 normalize
+        return F.normalize(emb.float(), p=2, dim=-1)  # [N, 1024]
+```
+
+---
+
+## 5. Cross-Attention Transformer (Prompt Decoder)
+
+**File:** [transformer.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/transformer.py)
+
+Produces **mask embeddings** by letting text prompts attend to image features.
+
+### 5.1 Setup
+
+```python
+# net.py L146-168
+self.project_bottleneck = nn.Linear(512, 256)   # Image → 256d
+self.project_text = nn.Linear(1024, 256)         # Text → 256d
+# 3-layer transformer: d_model=256, nhead=8, ffn=1024
+```
+
+### 5.2 Each Layer (Post-Norm)
+
+```python
+# transformer.py L196-219
+# 1. Self-attention among N=6 prompts (coordinate spatially)
+tgt = norm1(tgt + self_attn(tgt, tgt, tgt))
+# 2. Cross-attention: prompts attend to 64 image tokens
+tgt = norm2(tgt + cross_attn(tgt, memory+pos, memory))
+# 3. FFN
+tgt = norm3(tgt + ffn(tgt))
+```
+
+### 5.3 Mask Embedding Projections
+
+> [!IMPORTANT]
+> **Key difference for NoCFA:** 4 projections (including bottleneck 512) instead of 3.
+
+```python
+# net.py L170-184
+inject_proj_channels = (
+    decoder_in_channels if self.decoder_type == "ita_nocfa"  # [512, 320, 128, 64]
+    else decoder_in_channels[1:]                              # [320, 128, 64]
+)
+for ch in inject_proj_channels:
+    self.inject_mask_projs.append(nn.Sequential(
+        nn.Linear(256, 128), nn.GELU(), nn.Linear(128, ch)
+    ))
+# NoCFA output: [B,N,512], [B,N,320], [B,N,128], [B,N,64]
+```
+
+---
+
+## 6. DyITA-NoCFA Decoder
+
+**File:** [ITADecoder.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/decoders/ITADecoder.py#L259-L373)
+
+### 6.1 Key Difference from DyITA
+
+```diff
+- Stage 4: CFAModule(x)                       ← text-UNAWARE (from CENet)
++ Stage 4: ITABlock(x, text_embed[B,N,512])   ← text-AWARE (pure DyITA)
+```
+
+### 6.2 Constructor
+
+```python
+# ITADecoder.py L259-317
+class DyITADecoderNoCFA(DyITADecoder):
+    """Replaces CFAModule bottleneck with ITABlock."""
+
+    def __init__(self, ..., bottleneck_n_heads=2):
+        super().__init__(...)   # Inherits up3, up2, up1, dec3, dec2, dec1
+
+        # Replace CFAModule with ITABlock at bottleneck
+        self.dec4 = ITABlock(
+            embed_dim=512,              # Bottleneck channels
+            n_heads=bottleneck_n_heads,  # 2 heads → 256 dim/head
+            ffn_ratio=4.0,
+            init_value=0.1,             # LayerScale init
+            n_projectors=3,
+            n_kernel_factors=9,
+            n_diff_factors=9,
+            gamma_init=3.0,
+            lambda_init=0.01,
+        )
+```
+
+### 6.3 Forward Pass
+
+```python
+# ITADecoder.py L319-372
+def forward(self, features, inject_mask_embeds):
+    # inject_mask_embeds: 4 tensors [B,N,512], [B,N,320], [B,N,128], [B,N,64]
+    f1, f2, f3, x = features
+
+    # Stage 4: ITABlock with text (NOT CFAModule!)
+    d4 = self.dec4(x, inject_mask_embeds[0])       # [B,512,8,8] + text[B,N,512]
+
+    # Stage 3: Upsample → Skip → ITABlock
+    d3 = self.up3(d4)                               # EUCB: [B,512,8,8] → [B,320,16,16]
+    d3 = d3 + f3                                    # Skip connection
+    d3 = self.dec3(d3, inject_mask_embeds[1])        # ITABlock + text[B,N,320]
+
+    # Stage 2: Upsample → Skip → ITABlock
+    d2 = self.up2(d3)                               # EUCB: → [B,128,32,32]
+    d2 = d2 + f2
+    d2 = self.dec2(d2, inject_mask_embeds[2])        # ITABlock + text[B,N,128]
+
+    # Stage 1: Upsample → Skip → ITABlock
+    d1 = self.up1(d2)                               # EUCB: → [B,64,64,64]
+    d1 = d1 + f1
+    d1 = self.dec1(d1, inject_mask_embeds[3])        # ITABlock + text[B,N,64]
+
+    # Output
+    logits = self.output(d1)                         # Conv 1×1 → [B,6,64,64]
+    logits = F.interpolate(logits, size=(256,256))   # ↑4× → [B,6,256,256]
+    return logits, ds3, ds2  # + deep supervision
+```
+
+---
+
+## 7. ITABlock — Decoder Block (Used at ALL 4 Stages)
+
+**File:** [dyita.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#L552-L661)
+
+```python
+# dyita.py L635-660
+def forward(self, x, txt_embed):     # [B,C,H,W], [B,N,C]
+    # Branch 1: DyITA cross-modal attention
+    identity = x
+    x_att = self.dyita(self.norm1(x), txt_embed)           # BN → DyITA
+    x = identity + drop_path(layer_scale_1 * x_att)        # LayerScale(0.1) + residual
+
+    # Branch 2: GatedConvFFN (local spatial mixing)
+    identity = x
+    x_ffn = self.ffn(self.norm2(x))                         # BN → GatedConvFFN
+    x = identity + drop_path(layer_scale_2 * x_ffn)        # LayerScale(0.1) + residual
+    return x
+```
+
+---
+
+## 8. DyITA Module — Cross-Modal Attention Engine
+
+**File:** [dyita.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#L302-L458)
+
+Five sub-components process image features `[B,C,H,W]` with text `[B,N,C]`:
+
+### 8.1 Dynamic Projection Module ([L64-159](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#L64-L159))
+
+Creates Q, K, V plus **redundancy projectors** Q', K' via routed token-specific projector banks:
+
+```python
+# Standard: Q = W_Q(image), K = W_Q(text), V = W_V(text)
+# Routed:   Q' = image @ Projectors_Q[route_idx]    ← STE argmax routing
+#           K' = text  @ Projectors_K[route_idx]    ← from bank of 3 projectors
+```
+
+> **STE Argmax:** Forward uses hard one-hot selection, backward uses soft gradients.
+
+### 8.2 Dynamic Measure Kernel ([L166-222](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#L166-L222))
+
+**Norm-preserving power operation** for sharper similarity:
+
+```python
+φ_γ(Z) = softplus(Z)^γ * (‖Z‖ / ‖softplus(Z)^γ‖)
+# γ routed per-token from bank of 9 learnable values (init=3.0)
+```
+
+Applied to all 4 representations: Q̃=φ(Q), K̃=φ(K), Q̃'=φ(Q'), K̃'=φ(K')
+
+### 8.3 Token Differential Operator ([L224-300](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#L224-L300))
+
+Removes redundant info then computes attention:
+
+```python
+Q_diff = Q̃ - λ_Q · Q̃'     # λ routed per-token from bank of 9 (init=0.01)
+K_diff = K̃ - λ_K · K̃'
+
+# Hybrid attention (softmax for N≤16, linear for larger N):
+if N <= 16:  # Our N=6 → uses softmax (more expressive)
+    O = softmax(Q_diff @ K_diff.T / √d) @ V
+else:
+    O = Q_diff @ (K_diff.T @ V)   # Linear: O(Sd²)
+```
+
+### 8.4 DWConv Residual
+
+Local spatial bias added to output:
+
+```python
+dwc_res = DWConv3x3(BatchNorm(img_feat))   # [B,C,H,W]
+output = text_fused_output + dwc_res
+```
+
+### 8.5 Complete DyITA Forward
+
+```python
+def forward(self, img_feat, txt_embed):  # [B,C,H,W], [B,N,C]
+    dwc_res = self.dwc_v(img_feat)                          # Local bias
+    img_tokens = img_feat.flatten(2).transpose(1,2)         # → [B,S,C]
+
+    Q, K, V, Q', K' = self.dyn_proj(img_tokens, txt_embed)  # Dynamic Projection
+    Q̃, K̃, Q̃', K̃' = kernels(Q, K, Q', K')                   # Measure Kernel
+    O = self.tdo(Q̃, Q̃', K̃, K̃', V)                          # Token Differential + Attention
+
+    O = out_proj(merge_heads(O)) → reshape to [B,C,H,W]
+    return O + dwc_res
+```
+
+---
+
+## 9. GatedConvFFN ([L461-545](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py#L461-L545))
+
+SwiGLU-style FFN with depthwise convolution:
+
+```python
+def forward(self, x):          # [B, C, H, W]
+    x = fc1(x)                # Conv1×1: C → 2·hidden (expand + split)
+    value, gate = x.chunk(2)   # [B, hidden, H, W] each
+    value = SiLU(BN(DWConv3x3(SiLU(value))))   # Local spatial mixing
+    gate = SiLU(gate)
+    return fc2(value * gate)   # Conv1×1: hidden → C
+```
+
+---
+
+## 10. EUCB Upsampling ([blocks.py L297-321](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/blocks.py#L297-L321))
+
+```python
+class EUCB:  # Efficient Up-Convolution Block
+    def forward(self, x):
+        x = Upsample(2×)(x)           # Bilinear ↑2×
+        x = DWConv3x3(BN(LeakyReLU(x))) # Depthwise refinement
+        x = channel_shuffle(x)         # Cross-group mixing
+        x = Conv1x1(x)                # Pointwise: in_ch → out_ch
+        return x
+```
+
+---
+
+## 11. Complete Data Flow
+
+```
+Image [B,3,256,256]              Text Prompts (N=6)
+    │                                  │
+    ▼                                  ▼
+┌─────────────────────┐    ┌──────────────────────────┐
+│  PVT-v2-B2 Encoder  │    │ Qwen3-0.6B (frozen)      │
+│  f1: [B,64,64,64]  ─┼──┐ │ → [B,N,1024]             │
+│  f2: [B,128,32,32] ─┼─┐│ │ → Linear → [B,N,256]     │
+│  f3: [B,320,16,16] ─┼┐││ └─────────┬────────────────┘
+│  f4: [B,512,8,8]  ──┼┼┼┤           │
+└─────────────────────┘││││           │
+                       │││▼           ▼
+              ┌────────┼┼┼────────────────────────────┐
+              │  Cross-Attention Transformer (×3)      │
+              │  Text[N,B,256] × Image[64,B,256]       │
+              │  → Self-Attn → Cross-Attn → FFN        │
+              │  → Mask Embeddings [B,N,256]            │
+              │  → Project: [B,N,512],[B,N,320],        │
+              │             [B,N,128],[B,N,64]          │
+              └──┬─────────┬──────────┬─────────┬──────┘
+                 │         │          │         │
+                 ▼         ▼          ▼         ▼
+        ┌────────────────────────────────────────────────────────┐
+        │  DyITA-NoCFA Decoder (ALL stages = ITABlock)          │
+        │                                                        │
+        │  Stage 4: ITABlock(f4, text[B,N,512])  ★ text-aware!  │
+        │      │                                                 │
+        │  Stage 3: EUCB↑(d4) + f3 → ITABlock(text[B,N,320])   │
+        │      │                                                 │
+        │  Stage 2: EUCB↑(d3) + f2 → ITABlock(text[B,N,128])   │
+        │      │                                                 │
+        │  Stage 1: EUCB↑(d2) + f1 → ITABlock(text[B,N,64])    │
+        │      │                                                 │
+        │  Conv1×1 → ↑4× → [B, 6, 256, 256]                    │
+        └────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 12. DyITA vs DyITA-NoCFA Comparison
+
+| Aspect | DyITA (`--decoder_type ita`) | DyITA-NoCFA (`--decoder_type dyITA_NoCFA`) |
+|--------|-----|----------|
+| Bottleneck (Stage 4) | **CFAModule** (text-unaware, from CENet) | **ITABlock** (text-aware, pure DyITA) |
+| Text embeddings needed | 3: `[B,N,320/128/64]` | **4:** `[B,N,512/320/128/64]` |
+| Mask projections | 3 (Linear 256→320/128/64) | **4** (Linear 256→512/320/128/64) |
+| CENet dependency | Yes (CFAModule) | **None** |
+| Text influence at bottleneck | ✗ No | **✓ Yes** |
+| Parameters | Slightly fewer | Slightly more (extra ITABlock + projection) |
+
+---
+
+## 13. Key Files Reference
+
+| File | Lines | What It Contains |
+|------|-------|-----------------|
+| [net.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/net.py) | 399 | Main [P2Echo](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/net.py#40-345) model, decoder type routing, mask projections |
+| [pvtv2.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/pvtv2.py) | 432 | PVT-v2 encoder (4-stage hierarchical ViT) |
+| [text_encoder.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/text_encoder.py) | 197 | Frozen Qwen3 text encoder with caching |
+| [transformer.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/transformer.py) | 278 | Cross-attention transformer (3 layers, post-norm) |
+| [prompts.py](file:///scratch/moeinh78/P2Echo-new/src/prompts.py) | 397 | View-aware prompt generation system |
+| [ITADecoder.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/decoders/ITADecoder.py) | 373 | [DyITADecoder](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/decoders/ITADecoder.py#47-257) (L47-257) + [DyITADecoderNoCFA](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/decoders/ITADecoder.py#259-373) (L259-373) |
+| [dyita.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/dyita.py) | 661 | DyITA module, ITABlock, GatedConvFFN |
+| [blocks.py](file:///scratch/moeinh78/P2Echo-new/src/networks/p2echo/modules/blocks.py) | 323 | EUCB, UpConv, UpRb, UpTConv |
