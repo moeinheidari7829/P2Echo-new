@@ -85,8 +85,11 @@ def infer_decoder_config_from_state_dict(state_dict: Dict[str, torch.Tensor]) ->
     """
     keys = state_dict.keys()
     has_dyita = any(".dyita." in k for k in keys)
+    has_dyita_dec4 = any(k.startswith("decoder.dec4.dyita.") for k in keys)
     has_inject_convs = any(k.startswith("decoder.inject_convs.") for k in keys)
 
+    if has_dyita_dec4:
+        return "ita_nocfa", has_inject_convs
     if has_dyita:
         return "ita", has_inject_convs
     return "cenet", False
@@ -220,6 +223,29 @@ def mask_probs_for_labels(
     return masked
 
 
+def suppress_predictions_for_gt_absent_classes(
+    *,
+    pred_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    class_ids: Sequence[int] | None = None,
+) -> np.ndarray:
+    """
+    Set predictions to BG for classes that are absent in this sample's GT.
+
+    This mirrors U-Bench-style metric postprocessing and is useful for
+    apples-to-apples comparison across codebases.
+    """
+    out = pred_mask.copy()
+    present_ids = set(int(x) for x in np.unique(gt_mask))
+    if class_ids is None:
+        class_ids = [1, 2, 3, 4, 5]
+    for cid in class_ids:
+        cid_int = int(cid)
+        if cid_int != 0 and cid_int not in present_ids:
+            out[out == cid_int] = 0
+    return out
+
+
 # =============================================================================
 # Qualitative visualization
 # =============================================================================
@@ -294,6 +320,8 @@ def evaluate(
     device: torch.device,
     use_amp: bool,
     amp_dtype: torch.dtype,
+    logits_mode: str = "sigmoid",
+    suppress_predictions_for_classes_absent_in_ground_truth: bool = True,
     threshold: float = 0.5,
     max_qual_per_dataset: int = 10,
     output_dir: Path,
@@ -338,7 +366,10 @@ def evaluate(
         else:
             logits = outputs
 
-        probs = torch.sigmoid(logits).detach().float().cpu().numpy()
+        if logits_mode == "softmax":
+            probs = F.softmax(logits, dim=1).detach().float().cpu().numpy()
+        else:
+            probs = torch.sigmoid(logits).detach().float().cpu().numpy()
         gt_np = gt.detach().cpu().numpy().astype(np.uint8)
 
         for i in range(b):
@@ -357,11 +388,20 @@ def evaluate(
                 valid_label_ids=valid_labels,
             )
 
-            pred_mc = preds_to_multiclass_mask(
-                probs=masked_probs,
-                prompt_specs=prompt_specs,
-                threshold=threshold,
-            )
+            if logits_mode == "softmax":
+                pred_mc = np.argmax(masked_probs, axis=0).astype(np.uint8)
+            else:
+                pred_mc = preds_to_multiclass_mask(
+                    probs=masked_probs,
+                    prompt_specs=prompt_specs,
+                    threshold=threshold,
+                )
+            if suppress_predictions_for_classes_absent_in_ground_truth:
+                pred_mc = suppress_predictions_for_gt_absent_classes(
+                    pred_mask=pred_mc,
+                    gt_mask=gt_np[i],
+                    class_ids=valid_labels,
+                )
 
             if valid_labels:
                 agg.update(
@@ -521,16 +561,34 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pretrained_dir", type=str, default="./pretrained_pth")
-    parser.add_argument("--decoder_type", type=str, default="auto", choices=["auto", "cenet", "ita"],
-                        help="Decoder type to instantiate. 'auto' infers from checkpoint keys.")
+    parser.add_argument(
+        "--decoder_type",
+        type=str,
+        default="auto",
+        choices=["auto", "cenet", "ita", "ita_nocfa", "dyITA_NoCFA"],
+        help=(
+            "Decoder type to instantiate. 'auto' infers from checkpoint keys. "
+            "Use 'ita_nocfa'/'dyITA_NoCFA' for DyITA bottleneck without CFAModule."
+        ),
+    )
     parser.add_argument("--ita_dual_injection", action="store_true",
-                        help="For decoder_type=ita: enable post-hoc text injection after ITABlock.")
+                        help="For decoder_type in {ita, ita_nocfa}: enable post-hoc text injection after ITABlock.")
+    parser.add_argument("--logits_mode", type=str, default="sigmoid", choices=["sigmoid", "softmax"],
+                        help="How to decode logits: sigmoid-threshold (binary prompts) or softmax-argmax (multiclass).")
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--max_qual", type=int, default=10,
                         help="Max qualitative figures per dataset")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Probability threshold for binary masks")
+    parser.add_argument(
+        "--suppress_predictions_for_classes_absent_in_ground_truth",
+        action="store_true",
+        help=(
+            "For metric computation, set predicted pixels to background for classes "
+            "that are absent in each sample's ground-truth mask."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
@@ -602,6 +660,8 @@ def main():
     state_dict = ckpt["model_state_dict"]
     inferred_decoder_type, inferred_ita_dual = infer_decoder_config_from_state_dict(state_dict)
     decoder_type = inferred_decoder_type if args.decoder_type == "auto" else args.decoder_type
+    if decoder_type == "dyITA_NoCFA":
+        decoder_type = "ita_nocfa"
     ita_dual_injection = bool(args.ita_dual_injection) or (
         args.decoder_type == "auto" and inferred_ita_dual
     )
@@ -610,6 +670,12 @@ def main():
     _log(
         f"[{_now()}] Decoder config: decoder_type={decoder_type}, "
         f"ita_dual_injection={ita_dual_injection}",
+        log_path,
+    )
+    _log(f"[{_now()}] Logits decode mode: {args.logits_mode}", log_path)
+    _log(
+        f"[{_now()}] Suppress GT-absent predicted classes: "
+        f"{args.suppress_predictions_for_classes_absent_in_ground_truth}",
         log_path,
     )
     num_classes = len(prompt_specs)
@@ -651,6 +717,10 @@ def main():
         device=device,
         use_amp=args.use_amp,
         amp_dtype=amp_dtype,
+        logits_mode=args.logits_mode,
+        suppress_predictions_for_classes_absent_in_ground_truth=(
+            args.suppress_predictions_for_classes_absent_in_ground_truth
+        ),
         threshold=args.threshold,
         max_qual_per_dataset=args.max_qual,
         output_dir=output_dir,

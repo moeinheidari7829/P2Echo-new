@@ -33,7 +33,7 @@ from einops import rearrange
 from positional_encodings.torch_encodings import PositionalEncoding2D
 
 from .encoder import get_encoder2d
-from .decoders import CENetDecoder, DyITADecoder
+from .decoders import CENetDecoder, DyITADecoder, DyITADecoderNoCFA
 from .transformer import TransformerDecoder, TransformerDecoderLayer
 
 
@@ -91,12 +91,12 @@ class P2Echo(nn.Module):
         transformer_ffn_dim: int = 1024,  # 4x query_dim (standard ratio)
         # Decoder config
         num_classes: int = 6,
-        decoder_type: str = "cenet",  # "cenet" or "ita"
+        decoder_type: str = "cenet",  # "cenet", "ita", or "ita_nocfa" ("dyITA_NoCFA" alias)
         decoder_depths: Tuple[int, ...] = (4, 2, 1, 1),
         decoder_embed_dim: int = 64,
         deep_supervision: bool = True,
         drop_path_rate: float = 0.1,
-        # DyITA decoder hyperparameters (only used when decoder_type="ita")
+        # DyITA decoder hyperparameters (used when decoder_type in {"ita", "ita_nocfa"})
         ita_n_heads: Tuple[int, ...] = (2, 2, 2),
         ita_n_projectors: int = 3,
         ita_n_kernel_factors: int = 9,
@@ -113,6 +113,14 @@ class P2Echo(nn.Module):
         self.deep_supervision = deep_supervision
         self.query_dim = query_dim
         self.decoder_embed_dim = decoder_embed_dim
+        if decoder_type == "dyITA_NoCFA":
+            decoder_type = "ita_nocfa"
+        decoder_type = str(decoder_type).lower()
+        if decoder_type not in {"cenet", "ita", "ita_nocfa"}:
+            raise ValueError(
+                f"Invalid decoder_type={decoder_type!r}. "
+                "Choose from {'cenet', 'ita', 'ita_nocfa'} (or alias 'dyITA_NoCFA')."
+            )
         self.decoder_type = decoder_type
         
         # =====================================================================
@@ -159,12 +167,16 @@ class P2Echo(nn.Module):
             norm=nn.LayerNorm(query_dim),
         )
         
-        # Mask embedding projections for text injection at decoder stages 1-3.
-        # With CENet decoder channels [512, 320, 128, 64], injected stages are:
-        #   Stage 1: 320, Stage 2: 128, Stage 3: 64.
+        # Mask embedding projections for text injection.
+        # - cenet / ita: projections for stages 3->1 = [320, 128, 64]
+        # - ita_nocfa: projections for stages 4->1 = [512, 320, 128, 64]
         decoder_in_channels = encoder_channels  # deepest -> shallowest
         self.inject_mask_projs = nn.ModuleList()
-        for ch in decoder_in_channels[1:]:
+        inject_proj_channels = (
+            decoder_in_channels if self.decoder_type == "ita_nocfa"
+            else decoder_in_channels[1:]
+        )
+        for ch in inject_proj_channels:
             self.inject_mask_projs.append(nn.Sequential(
                 nn.Linear(query_dim, query_dim // 2),
                 nn.GELU(),
@@ -174,8 +186,24 @@ class P2Echo(nn.Module):
         # =====================================================================
         # Decoder: CENet-style or DyITA decoder
         # =====================================================================
-        if decoder_type == "ita":
+        if self.decoder_type == "ita":
             self.decoder = DyITADecoder(
+                channels=decoder_in_channels,
+                up_block='eucb',
+                num_classes=num_classes,
+                n_heads=list(ita_n_heads),
+                n_projectors=ita_n_projectors,
+                n_kernel_factors=ita_n_kernel_factors,
+                n_diff_factors=ita_n_diff_factors,
+                ffn_ratio=ita_ffn_ratio,
+                drop_path_rate=drop_path_rate,
+                gamma_init=ita_gamma_init,
+                lambda_init=ita_lambda_init,
+                dual_injection=ita_dual_injection,
+                deep_supervision=deep_supervision,
+            )
+        elif self.decoder_type == "ita_nocfa":
+            self.decoder = DyITADecoderNoCFA(
                 channels=decoder_in_channels,
                 up_block='eucb',
                 num_classes=num_classes,
@@ -289,7 +317,8 @@ class P2Echo(nn.Module):
         
         # Project mask embeddings for injection at decoder stages 1-3
         inject_mask_embeds = [proj(mask_embedding) for proj in self.inject_mask_projs]
-        # [B,N,320], [B,N,128], [B,N,64] for PVT-v2-B2 channels
+        # cenet/ita: [B,N,320], [B,N,128], [B,N,64]
+        # ita_nocfa: [B,N,512], [B,N,320], [B,N,128], [B,N,64]
         
         # =====================================================================
         # 3. Decoder: Single pass with all N embeddings injected together

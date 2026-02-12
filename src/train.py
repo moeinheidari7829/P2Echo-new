@@ -258,6 +258,29 @@ def mask_probs_for_labels(
     return masked
 
 
+def suppress_predictions_for_gt_absent_classes(
+    *,
+    pred_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    class_ids: Sequence[int] | None = None,
+) -> np.ndarray:
+    """
+    Set predictions to BG for classes not present in the sample's GT.
+
+    This matches U-Bench-style postprocessing where any class absent in GT
+    is not allowed to remain in prediction for metric computation.
+    """
+    out = pred_mask.copy()
+    present_ids = set(int(x) for x in np.unique(gt_mask))
+    if class_ids is None:
+        class_ids = [1, 2, 3, 4, 5]
+    for cid in class_ids:
+        cid_int = int(cid)
+        if cid_int != 0 and cid_int not in present_ids:
+            out[out == cid_int] = 0
+    return out
+
+
 def save_qualitative_grid(
     *,
     out_path: Path,
@@ -320,14 +343,19 @@ def save_qualitative_per_dataset(
         for ex in items:
             img = ex["image"]  # torch [3,H,W]
             gt = ex["gt"]  # torch [H,W]
-            probs = ex["probs"]  # torch [N,H,W]
             plane = str(ex.get("plane", ""))
             stem = str(ex.get("stem", ""))
 
             img_np = denorm_img(img)
             gt_np = gt.detach().cpu().numpy().astype(np.uint8)
-            probs_np = probs.detach().cpu().float().numpy()
-            pred_np = preds_to_multiclass_mask(probs=probs_np, prompt_specs=prompt_specs, threshold=threshold)
+            if "pred" in ex:
+                pred_np = ex["pred"].detach().cpu().numpy().astype(np.uint8)
+            else:
+                probs = ex["probs"]  # torch [N,H,W]
+                probs_np = probs.detach().cpu().float().numpy()
+                pred_np = preds_to_multiclass_mask(
+                    probs=probs_np, prompt_specs=prompt_specs, threshold=threshold
+                )
 
             out_path = out_dir / dataset / f"{stem}_{plane}.png"
             title = f"{dataset} | {plane} | {stem}"
@@ -346,6 +374,8 @@ def build_text_embeddings(
     prompt_specs: Sequence[PromptSpec],
     device: torch.device,
     prompt_mask: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    keep_class_prompts_for_inactive_valid_labels: bool = False,
 ) -> torch.Tensor:
     """
     Build text embeddings for a batch. Returns [B, N, D].
@@ -355,6 +385,8 @@ def build_text_embeddings(
         gt_mask=gt_mask,
         prompt_specs=prompt_specs,
         prompt_mask=prompt_mask,
+        valid_mask=valid_mask,
+        keep_class_prompts_for_inactive_valid_labels=keep_class_prompts_for_inactive_valid_labels,
     )
     flat = [p for per in prompt_texts for p in per]
     emb_flat = text_backbone.embed_prompts(flat, device=device)  # [B*N, D]
@@ -369,14 +401,22 @@ def _build_batch_prompt_texts_from_gt(
     gt_mask: torch.Tensor,
     prompt_specs: Sequence[PromptSpec],
     prompt_mask: torch.Tensor | None,
+    valid_mask: torch.Tensor | None,
+    keep_class_prompts_for_inactive_valid_labels: bool,
 ) -> List[List[str]]:
     out: List[List[str]] = []
     for bi, p in enumerate(planes):
         per: List[str] = []
         for pi, spec in enumerate(prompt_specs):
             if prompt_mask is not None and float(prompt_mask[bi, pi].item()) < 0.5:
-                per.append(build_background_prompt_text(plane=str(p)))
-                continue
+                keep_class_prompt = (
+                    keep_class_prompts_for_inactive_valid_labels
+                    and valid_mask is not None
+                    and float(valid_mask[bi, pi].item()) >= 0.5
+                )
+                if not keep_class_prompt:
+                    per.append(build_background_prompt_text(plane=str(p)))
+                    continue
             per.append(
                 build_prompt_text_from_view(
                     plane=str(p),
@@ -560,6 +600,7 @@ def train_one_epoch(
     epoch: int = 0,
     use_categorical_targets: bool = False,
     use_all_prompts: bool = False,
+    keep_class_prompts_for_inactive_valid_labels: bool = False,
 ) -> float:
     model.train()
     loss_sum = 0.0
@@ -622,6 +663,10 @@ def train_one_epoch(
             prompt_specs=prompt_specs,
             device=device,
             prompt_mask=prompt_mask if use_categorical_targets else None,
+            valid_mask=valid_mask if use_categorical_targets else None,
+            keep_class_prompts_for_inactive_valid_labels=(
+                keep_class_prompts_for_inactive_valid_labels and use_categorical_targets
+            ),
         )
 
         # Prompt permutation (if enabled) — only for binary targets
@@ -690,6 +735,8 @@ def validate(
     device: torch.device,
     use_amp: bool,
     amp_dtype: torch.dtype,
+    use_categorical_targets: bool = False,
+    suppress_predictions_for_classes_absent_in_ground_truth: bool = False,
     threshold: float = 0.5,
     max_qual_per_dataset: int = 3,
 ) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
@@ -733,11 +780,17 @@ def validate(
         else:
             logits = outputs
 
-        probs = torch.sigmoid(logits)  # [B,N,H,W]
+        if use_categorical_targets:
+            # Multiclass-aligned validation path for DiceCE training.
+            probs = F.softmax(logits, dim=1)  # [B,N,H,W]
+        else:
+            # Binary-per-prompt validation path for boundary/dice_bce.
+            probs = torch.sigmoid(logits)  # [B,N,H,W]
         probs_np = probs.detach().float().cpu().numpy()
         gt_np = gt.detach().cpu().numpy().astype(np.uint8)
 
         masked_probs_list: List[np.ndarray] = []
+        pred_mc_list: List[np.ndarray] = []
 
         # Per-case medpy metrics (multiclass)
         for i in range(b):
@@ -757,11 +810,22 @@ def validate(
             )
             masked_probs_list.append(masked_probs)
 
-            pred_mc = preds_to_multiclass_mask(
-                probs=masked_probs,
-                prompt_specs=prompt_specs,
-                threshold=threshold,
-            )
+            if use_categorical_targets:
+                # For softmax training, decode exactly as multiclass argmax.
+                pred_mc = np.argmax(masked_probs, axis=0).astype(np.uint8)
+            else:
+                pred_mc = preds_to_multiclass_mask(
+                    probs=masked_probs,
+                    prompt_specs=prompt_specs,
+                    threshold=threshold,
+                )
+            if suppress_predictions_for_classes_absent_in_ground_truth:
+                pred_mc = suppress_predictions_for_gt_absent_classes(
+                    pred_mask=pred_mc,
+                    gt_mask=gt_np[i],
+                    class_ids=valid_labels,
+                )
+            pred_mc_list.append(pred_mc)
 
             if valid_labels:
                 agg.update(
@@ -780,6 +844,7 @@ def validate(
                     "image": img[i].cpu(),
                     "gt": gt[i].cpu(),
                     "probs": torch.from_numpy(masked_probs_list[i]),
+                    "pred": torch.from_numpy(pred_mc_list[i]),
                     "plane": str(planes[i]),
                     "stem": str(stems[i]) if stems else "",
                 })
@@ -807,8 +872,16 @@ def main():
     parser.add_argument("--pretrained_dir", type=str, default="./pretrained_pth")
     parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--text_cache_dir", type=str, default="/project/def-ilkerh/moeinh78/.cache/huggingface/hub/")
-    parser.add_argument("--decoder_type", type=str, default="cenet", choices=["cenet", "ita"],
-                        help="Decoder type: 'cenet' (original) or 'ita' (DyITA decoder)")
+    parser.add_argument(
+        "--decoder_type",
+        type=str,
+        default="cenet",
+        choices=["cenet", "ita", "ita_nocfa", "dyITA_NoCFA"],
+        help=(
+            "Decoder type: 'cenet' (original), 'ita' (DyITA + CFAM bottleneck), "
+            "'ita_nocfa'/'dyITA_NoCFA' (DyITA at all stages, including bottleneck)."
+        ),
+    )
     parser.add_argument("--ita_dual_injection", action="store_true",
                         help="DyITA: also apply post-hoc text injection after ITABlock (ablation)")
     
@@ -825,6 +898,22 @@ def main():
     parser.add_argument("--permute_prompts", action="store_true")
     parser.add_argument("--use_all_prompts", action="store_true",
                         help="Use all available prompts every iteration (default: randomly sample a subset)")
+    parser.add_argument(
+        "--keep_class_prompts_for_inactive_valid_labels",
+        action="store_true",
+        help=(
+            "For categorical training, keep class-specific text prompts for valid labels "
+            "that are inactive in prompt sampling, instead of replacing them with background prompts."
+        ),
+    )
+    parser.add_argument(
+        "--suppress_predictions_for_classes_absent_in_ground_truth",
+        action="store_true",
+        help=(
+            "During validation metrics, set predicted pixels to background for any class "
+            "that is absent in that sample's ground-truth mask."
+        ),
+    )
     parser.add_argument("--disable_aug", action="store_true")
     parser.add_argument("--loss_type", type=str, default="dice_ce", choices=["dice_bce", "boundary", "dice_ce"])
     
@@ -984,6 +1073,7 @@ def main():
             epoch=epoch,
             use_categorical_targets=(args.loss_type == "dice_ce"),
             use_all_prompts=args.use_all_prompts,
+            keep_class_prompts_for_inactive_valid_labels=args.keep_class_prompts_for_inactive_valid_labels,
         )
         _log(f"[{_now()}] Train loss: {train_loss:.4f}", log_path)
         # Note: scheduler.step() is now called per-iteration inside train_one_epoch
@@ -998,6 +1088,10 @@ def main():
                 device=device,
                 use_amp=args.use_amp,
                 amp_dtype=amp_dtype,
+                use_categorical_targets=(args.loss_type == "dice_ce"),
+                suppress_predictions_for_classes_absent_in_ground_truth=(
+                    args.suppress_predictions_for_classes_absent_in_ground_truth
+                ),
             )
 
             mean_metrics = metrics.get("mean_metrics", {})

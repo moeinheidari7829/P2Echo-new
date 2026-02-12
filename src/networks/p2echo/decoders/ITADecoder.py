@@ -254,3 +254,119 @@ class DyITADecoder(nn.Module):
             return logits, ds3, ds2
 
         return logits
+
+
+class DyITADecoderNoCFA(DyITADecoder):
+    """
+    DyITA decoder variant with ITABlock at bottleneck (no CFAModule).
+
+    Differences from DyITADecoder:
+      - dec4 is ITABlock and receives text embeddings
+      - expected text embedding list is length 4:
+          [B,N,512], [B,N,320], [B,N,128], [B,N,64]
+    """
+
+    def __init__(
+        self,
+        channels: list = [512, 320, 128, 64],
+        up_block: str = "eucb",
+        num_classes: int = 6,
+        n_heads: list = [2, 2, 2],
+        n_projectors: int = 3,
+        n_kernel_factors: int = 9,
+        n_diff_factors: int = 9,
+        ffn_ratio: float = 4.0,
+        drop_path_rate: float = 0.0,
+        gamma_init: float = 3.0,
+        lambda_init: float = 0.01,
+        dual_injection: bool = False,
+        deep_supervision: bool = True,
+        bottleneck_n_heads: int = 2,
+        writer=None,
+    ):
+        super().__init__(
+            channels=channels,
+            up_block=up_block,
+            num_classes=num_classes,
+            n_heads=n_heads,
+            n_projectors=n_projectors,
+            n_kernel_factors=n_kernel_factors,
+            n_diff_factors=n_diff_factors,
+            ffn_ratio=ffn_ratio,
+            drop_path_rate=drop_path_rate,
+            gamma_init=gamma_init,
+            lambda_init=lambda_init,
+            dual_injection=dual_injection,
+            deep_supervision=deep_supervision,
+            writer=writer,
+        )
+
+        # Replace CFAModule bottleneck with ITABlock.
+        self.dec4 = ITABlock(
+            embed_dim=channels[0],
+            n_heads=bottleneck_n_heads,
+            ffn_ratio=ffn_ratio,
+            drop_rate=0.0,
+            drop_path_rate=drop_path_rate,
+            init_value=0.1,
+            n_projectors=n_projectors,
+            n_kernel_factors=n_kernel_factors,
+            n_diff_factors=n_diff_factors,
+            gamma_init=gamma_init,
+            lambda_init=lambda_init,
+        )
+
+    def forward(
+        self,
+        features: list,
+        inject_mask_embeds: list,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        if len(inject_mask_embeds) != 4:
+            raise ValueError(
+                "DyITADecoderNoCFA expects 4 stage text embeddings: "
+                "[B,N,512], [B,N,320], [B,N,128], [B,N,64]."
+            )
+
+        f1, f2, f3, x = features
+        skips_3, skips_2, skips_1 = f3, f2, f1
+
+        # --- Stage 4: bottleneck ITABlock (text-aware) ---
+        d4 = self.dec4(x, inject_mask_embeds[0])
+
+        # --- Stage 3 ---
+        d3 = self.up3(d4)
+        d3 = d3 + skips_3
+        d3 = self.dec3(d3, inject_mask_embeds[1])
+        if self.dual_injection:
+            d3 = self._inject_text_posthoc(d3, inject_mask_embeds[1], stage_idx=1)
+
+        if self.deep_supervision:
+            ds3 = self.ds_heads[0](d3)
+
+        # --- Stage 2 ---
+        d2 = self.up2(d3)
+        d2 = d2 + skips_2
+        d2 = self.dec2(d2, inject_mask_embeds[2])
+        if self.dual_injection:
+            d2 = self._inject_text_posthoc(d2, inject_mask_embeds[2], stage_idx=2)
+
+        if self.deep_supervision:
+            ds2 = self.ds_heads[1](d2)
+
+        # --- Stage 1 ---
+        d1 = self.up1(d2)
+        d1 = d1 + skips_1
+        d1 = self.dec1(d1, inject_mask_embeds[3])
+        if self.dual_injection:
+            d1 = self._inject_text_posthoc(d1, inject_mask_embeds[3], stage_idx=3)
+
+        logits = self.output(d1)
+        target_h, target_w = f1.shape[2] * 4, f1.shape[3] * 4
+        logits = F.interpolate(logits, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        if self.deep_supervision:
+            ds3 = F.interpolate(ds3, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            ds2 = F.interpolate(ds2, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            return logits, ds3, ds2
+
+        return logits
